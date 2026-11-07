@@ -205,7 +205,7 @@ export const simTick = spacetimedb.reducer(
     for (const r of [...ctx.db.rack.iter()]) {
       // Broken cooling climbs fast; healthy cooling drifts back to baseline.
       let temp = r.temperatureF;
-      if (r.failing) temp += 1.2 + ctx.random() * 0.8;
+      if (r.failing) temp += 0.6 + ctx.random() * 0.5;
       else temp += (BASELINE_F - temp) * 0.25 + (ctx.random() - 0.5) * 0.8;
       const power = Math.max(5, r.powerKw + (ctx.random() - 0.5) * 0.3);
 
@@ -295,11 +295,17 @@ export const claimWarning = spacetimedb.reducer(
 export const markFixed = spacetimedb.reducer(
   { warningId: t.u64(), techId: t.u64() },
   (ctx, { warningId, techId }) => {
-    requireTech(ctx, techId);
+    const who = requireTech(ctx, techId);
     const w = ctx.db.warning.id.find(warningId);
     if (!w) throw new SenderError('Warning not found');
     if (w.claimedBy !== techId) throw new SenderError('Only the owner can mark this fixed');
     ctx.db.warning.id.update({ ...w, status: 'fixing' });
+    // The tech's own steps are done; the agent's verification steps still wait on the data.
+    for (const tk of [...ctx.db.task.warningId.filter(warningId)]) {
+      if (tk.executor === 'tech' && tk.status !== 'done') {
+        ctx.db.task.id.update({ ...tk, status: 'done', result: `Done by ${who.name}` });
+      }
+    }
     const r = ctx.db.rack.id.find(w.rackId);
     if (r) ctx.db.rack.id.update({ ...r, failing: false });
   }
@@ -384,6 +390,48 @@ export const signHandoff = spacetimedb.reducer(
       });
     }
     ctx.db.handoff.id.update(next);
+  }
+);
+
+// The Nemotron agent raises an early warning before the hard rule trips.
+export const raiseWarning = spacetimedb.reducer(
+  { rackId: t.string(), severity: t.string(), message: t.string() },
+  (ctx, { rackId, severity, message }) => {
+    if (!ctx.db.rack.id.find(rackId)) throw new SenderError('Rack not found');
+    if (activeWarningFor(ctx, rackId)) return; // already being handled
+    const sev = ['low', 'medium', 'critical'].includes(severity) ? severity : 'medium';
+    ctx.db.warning.insert({
+      id: 0n,
+      rackId,
+      severity: sev,
+      message,
+      status: 'open',
+      source: 'agent',
+      createdAt: ctx.timestamp,
+      claimedBy: undefined,
+      claimedAt: undefined,
+      resolvedAt: undefined,
+    });
+  }
+);
+
+// The agent rewrites a pending handoff's brief (only before anyone has signed it).
+export const updateHandoffBrief = spacetimedb.reducer(
+  { handoffId: t.u64(), brief: t.string() },
+  (ctx, { handoffId, brief }) => {
+    const h = ctx.db.handoff.id.find(handoffId);
+    if (!h) throw new SenderError('Handoff not found');
+    if (h.fromSignedAt !== undefined || h.toSignedAt !== undefined) return; // never change what someone signed
+    ctx.db.handoff.id.update({ ...h, brief });
+  }
+);
+
+// Links a tech to their Solana wallet (public key only).
+export const setTechWallet = spacetimedb.reducer(
+  { techId: t.u64(), walletPubkey: t.string() },
+  (ctx, { techId, walletPubkey }) => {
+    const row = requireTech(ctx, techId);
+    ctx.db.tech.id.update({ ...row, walletPubkey });
   }
 );
 

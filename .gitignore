@@ -5,3 +5,10 @@ dist
 .DS_Store
 
 spacetime.local.json
+
+# secrets
+.env
+agent/.env
+chain/wallets.json
+chain/.spacetime-token
+agent/.spacetime-token

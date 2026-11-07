@@ -39,9 +39,12 @@ import BreakRackReducer from "./break_rack_reducer";
 import ClaimWarningReducer from "./claim_warning_reducer";
 import CreateHandoffReducer from "./create_handoff_reducer";
 import MarkFixedReducer from "./mark_fixed_reducer";
+import RaiseWarningReducer from "./raise_warning_reducer";
 import ResetDemoReducer from "./reset_demo_reducer";
+import SetTechWalletReducer from "./set_tech_wallet_reducer";
 import SetTxSignatureReducer from "./set_tx_signature_reducer";
 import SignHandoffReducer from "./sign_handoff_reducer";
+import UpdateHandoffBriefReducer from "./update_handoff_brief_reducer";
 import UpdateTaskReducer from "./update_task_reducer";
 
 // Import all procedure arg schemas
@@ -154,9 +157,12 @@ const reducersSchema = __reducers(
   __reducerSchema("claim_warning", ClaimWarningReducer),
   __reducerSchema("create_handoff", CreateHandoffReducer),
   __reducerSchema("mark_fixed", MarkFixedReducer),
+  __reducerSchema("raise_warning", RaiseWarningReducer),
   __reducerSchema("reset_demo", ResetDemoReducer),
+  __reducerSchema("set_tech_wallet", SetTechWalletReducer),
   __reducerSchema("set_tx_signature", SetTxSignatureReducer),
   __reducerSchema("sign_handoff", SignHandoffReducer),
+  __reducerSchema("update_handoff_brief", UpdateHandoffBriefReducer),
   __reducerSchema("update_task", UpdateTaskReducer),
 );
 
