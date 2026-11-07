@@ -8,9 +8,88 @@ import {
   t as __t,
   type AlgebraicTypeType as __AlgebraicTypeType,
   type Infer as __Infer,
-} from 'spacetimedb';
+} from "spacetimedb";
 
-export const Person = __t.object('Person', {
-  name: __t.string(),
+export const ChainRecord = __t.object("ChainRecord", {
+  id: __t.u64(),
+  kind: __t.string(),
+  refId: __t.u64(),
+  techIds: __t.array(__t.u64()),
+  summary: __t.string(),
+  createdAt: __t.timestamp(),
+  txSignature: __t.string(),
 });
-export type Person = __Infer<typeof Person>;
+export type ChainRecord = __Infer<typeof ChainRecord>;
+
+export const Handoff = __t.object("Handoff", {
+  id: __t.u64(),
+  fromTechId: __t.u64(),
+  toTechId: __t.u64(),
+  brief: __t.string(),
+  openWarningIds: __t.array(__t.u64()),
+  createdAt: __t.timestamp(),
+  fromSignedAt: __t.option(__t.timestamp()),
+  toSignedAt: __t.option(__t.timestamp()),
+  status: __t.string(),
+});
+export type Handoff = __Infer<typeof Handoff>;
+
+export const Rack = __t.object("Rack", {
+  id: __t.string(),
+  aisle: __t.string(),
+  temperatureF: __t.f64(),
+  powerKw: __t.f64(),
+  status: __t.string(),
+  failing: __t.bool(),
+});
+export type Rack = __Infer<typeof Rack>;
+
+export const SensorReading = __t.object("SensorReading", {
+  id: __t.u64(),
+  rackId: __t.string(),
+  temperatureF: __t.f64(),
+  powerKw: __t.f64(),
+  at: __t.timestamp(),
+});
+export type SensorReading = __Infer<typeof SensorReading>;
+
+export const SimTimer = __t.object("SimTimer", {
+  scheduledId: __t.u64(),
+  scheduledAt: __t.scheduleAt(),
+});
+export type SimTimer = __Infer<typeof SimTimer>;
+
+export const Task = __t.object("Task", {
+  id: __t.u64(),
+  warningId: __t.u64(),
+  stepNumber: __t.u32(),
+  description: __t.string(),
+  executor: __t.string(),
+  status: __t.string(),
+  result: __t.string(),
+});
+export type Task = __Infer<typeof Task>;
+
+export const Tech = __t.object("Tech", {
+  id: __t.u64(),
+  name: __t.string(),
+  role: __t.string(),
+  shift: __t.string(),
+  walletPubkey: __t.string(),
+});
+export type Tech = __Infer<typeof Tech>;
+
+export const Warning = __t.object("Warning", {
+  id: __t.u64(),
+  rackId: __t.string(),
+  severity: __t.string(),
+  message: __t.string(),
+  status: __t.string(),
+  source: __t.string(),
+  createdAt: __t.timestamp(),
+  claimedBy: __t.option(__t.u64()),
+  claimedAt: __t.option(__t.timestamp()),
+  resolvedAt: __t.option(__t.timestamp()),
+});
+export type Warning = __Infer<typeof Warning>;
+
