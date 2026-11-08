@@ -65,6 +65,7 @@ async function memoOf(sig: string): Promise<{ sha256?: string; prev?: string } |
 }
 type Check = { recordId: string; ok: boolean; note: string };
 
+const KIND_TITLE_SHORT: Record<string, string> = { cdu: 'coolant', cooling: 'overheating', pdu: 'power feed', power: 'power draw', disk: 'disk', network: 'network', humidity: 'humidity', reported: 'reported-issue' };
 const PAGE_LABEL: Record<string, string> = { queued: 'waiting for shift', acknowledged: 'acknowledged', missed: 'no answer', declined: 'declined', skipped: 'not needed' };
 const MODE_LABEL: Record<string, string> = { page_now: 'Paging now', holding: 'Holding for best person', symptom: 'Symptom of root cause', acknowledged: 'Acknowledged', resolved: 'Resolved', auto: 'Agent fixing it' };
 const Chip = ({ v, label }: { v: string; label?: string }) => (
@@ -159,6 +160,8 @@ export default function App() {
   const [floors] = useTable(tables.floor);
   const [links] = useTable(tables.chainLink);
   const [signals] = useTable(tables.tenantSignal);
+  const [pastFixes] = useTable(tables.pastFix);
+  const [profiles] = useTable(tables.techProfile);
   const declinePage = useReducer(reducers.declinePage);
   const overridePriority = useReducer(reducers.overridePriority);
   const setShift = useReducer(reducers.setShift);
@@ -499,7 +502,7 @@ export default function App() {
         <div className="kpis">
           <div className="kpi amber">
             <div className="kpi-l">Time to owned</div>
-            <div className="kpi-v">{ownedAvg ? `${ownedAvg}s` : '—'}</div>
+            <div className="kpi-v">{ownedAvg ? `${ownedAvg}s` : <span className="kpi-wait" />}</div>
             <div className="kpi-s">{ownedTimes.length ? `average over ${ownedTimes.length} incident${ownedTimes.length > 1 ? 's' : ''}` : 'alert until someone owns it'}</div>
           </div>
           <div className={`kpi ${escalated ? 'red' : 'green'}`}>
@@ -604,7 +607,7 @@ export default function App() {
                 <div key={aisle} className="aisle">
                   <div className="aisle-l">Aisle {aisle}</div>
                   <div className={`cdu-chip ${c && c.status !== 'ok' ? 'bad' : ''}`} title={c ? `${c.id}: ${c.flowLpm.toFixed(0)} L/min (normal ~120)` : ''}>
-                    <span className="cdu-chip-n">{c?.flowLpm.toFixed(0) ?? '—'}</span>
+                    <span className="cdu-chip-n">{c ? c.flowLpm.toFixed(0) : ''}</span>
                     <span className="cdu-chip-l">{c?.id ?? ''}</span>
                   </div>
                   <div className="aisle-racks">
@@ -764,6 +767,49 @@ export default function App() {
     );
   };
 
+  // Would this customer shrug this off, or make it a problem? Account history + what is in the news.
+  const tolerance = (tn?: (typeof tenants)[number], sig?: (typeof signals)[number]) => {
+    const reasons: { text: string; bad: boolean; url?: string; source?: string }[] = [];
+    const sla = tn?.slaPct ?? 99.9;
+    const mins = Math.round((1 - sla / 100) * 30 * 24 * 60);
+    const budget = mins >= 120 ? `${(mins / 60).toFixed(1)} hours` : `${mins} minutes`;
+    reasons.push({ text: `${sla}% SLA allows about ${budget} of downtime a month`, bad: mins <= 10 });
+    if (sig && sig.score > 0 && sig.headline) reasons.push({ text: `In the news: “${sig.headline}”${sig.note ? ` — ${sig.note}` : ''}`, bad: sig.score >= 2 });
+    if (tn?.flagNote) reasons.push({ text: `On their account: ${tn.flagNote}`, bad: (tn.flagLevel ?? 0) >= 2 });
+    // Anything they can open to check this themselves: real headlines plus the internal records.
+    const refs: { label: string; sub: string; url: string }[] = [];
+    if (sig?.url) refs.push({ label: sig.source || 'News', sub: sig.headline, url: sig.url });
+    // Everything else about this company, straight from the news — a real search, not a stored link.
+    if (sig?.company) refs.push({ label: `More on ${sig.company}`, sub: 'Recent coverage, newest first', url: `https://news.google.com/search?q=${encodeURIComponent(`"${sig.company}" when:14d`)}&hl=en-US&gl=US&ceid=US:en` });
+    const ref = tn ? 10000 + Number(tn.id) * 137 : 0;
+    if (tn?.flagNote) refs.push({ label: `Ticket #${ref}`, sub: tn.flagNote, url: `#ticket-${ref}` });
+    if (tn) refs.push({ label: 'SLA report', sub: `${tn.name} · monthly uptime and credits`, url: `#sla-${tn.id}` });
+    if (tn && (tn.flagLevel ?? 0) >= 1) refs.push({ label: 'Account history', sub: `${tn.name} · past incidents and credits paid`, url: `#account-${tn.id}` });
+    const heat = Math.max(sig?.score ?? 0, tn?.flagLevel ?? 0);
+    if (heat >= 2) return { level: 'hot', label: 'Low tolerance right now', why: 'Already dealing with a public problem. Another outage this week turns into an escalation and probably an SLA claim.', reasons, refs };
+    if (heat === 1) return { level: 'watch', label: 'Already watching', why: 'Not at breaking point, but they have raised things recently. A visible outage gets a phone call.', reasons, refs };
+    if (tn?.tier === 'critical') return { level: 'watch', label: 'Expects near-perfect', why: `Critical tier with almost no downtime allowance. A short blip is survivable, anything over ${budget} is a breach.`, reasons, refs };
+    if (tn?.tier === 'best-effort') return { level: 'calm', label: 'Would be fine', why: 'Best-effort tier with a generous allowance and nothing outstanding. A short outage would barely register.', reasons, refs };
+    return { level: 'calm', label: 'Would be understanding', why: 'Clean account and nothing in the news. A short outage is within what they expect, as long as it is explained.', reasons, refs };
+  };
+
+  // What this tech has actually done with this kind of fault, and how they compare to the rest.
+  const NEEDS: Record<string, string> = { cdu: 'cooling', cooling: 'cooling', humidity: 'cooling', pdu: 'electrical', power: 'electrical', network: 'network', disk: 'general', reported: 'general' };
+  const trackRecord = (techId: bigint, kind: string) => {
+    const fixes = [...pastFixes].filter(f => f.techId === techId && f.kind === kind).sort((a, b) => a.daysAgo - b.daysAgo);
+    const live = [...warnings].filter(x => x.status === 'resolved' && x.kind === kind && x.claimedBy === techId).length;
+    const best = fixes.length ? Math.min(...fixes.map(f => f.minutes)) : 0;
+    const fast = fixes.filter(f => f.minutes <= 15).length;
+    const avg = fixes.length ? Math.round(fixes.reduce((a, f) => a + f.minutes, 0) / fixes.length) : 0;
+    const skills = (profiles.find(x => x.techId === techId)?.skills ?? 'general').split(',');
+    return { fixes, live, best, fast, avg, skills, n: fixes.length + live };
+  };
+  const skillLine = (techId: bigint, kind: string) => {
+    const needed = NEEDS[kind] ?? 'general';
+    const sk = trackRecord(techId, kind).skills;
+    return sk.includes(needed) ? `${needed} specialist` : sk.includes('all') ? 'covers everything' : sk.includes('general') ? 'generalist' : `${sk.join('/')} background, not ${needed}`;
+  };
+
   // ─── incident page: summary strip, one action, then tabs ───
   const [incTab, setIncTab] = useState<'overview' | 'impact' | 'routing' | 'log'>('overview');
 
@@ -792,11 +838,48 @@ export default function App() {
       : w.kind === 'cdu' ? 'Clears when flow is above 105 L/min and pressure above 190 kPa'
       : w.kind === 'pdu' ? 'Clears when both PDU feeds are back online'
       : `Clears when ${km.label.toLowerCase()} is under ${km.ok}${km.unit}`;
-    const reading = !w ? '' : w.kind === 'cdu'
-      ? (() => { const c = cdus.find(x => x.id === w.rackId); return c ? `${c.flowLpm.toFixed(0)} L/min · ${c.pressureKpa.toFixed(0)} kPa` : ''; })()
-      : w.kind === 'pdu' ? (rack ? `PDU A ${pduText(rack.pduAOnline, rack.pduALoadPct)} · B ${pduText(rack.pduBOnline, rack.pduBLoadPct)}` : '')
-      : reported ? '' : fmt(w.kind, rack);
     const etaTxt = eta === 0 ? 'Now' : eta > 0 ? (eta < 1 ? `${Math.max(5, Math.round((eta * 60) / 5) * 5)} s` : `${Math.round(eta)} min`) : 'No deadline';
+
+    // Is this a drop-everything job? A tech judges on: is anything already broken, and is the backup gone?
+    const urg = (() => {
+      const rackDown = !!rack && rack.status === 'down';
+      const oneFeed = !!rack && rack.pduAOnline !== rack.pduBOnline;
+      const aisleCdu = rack ? cdus.find(c => c.id === `CDU-${rack.aisle}`) : w?.kind === 'cdu' ? cdus.find(c => c.id === w.rackId) : undefined;
+      const coolingBad = !!aisleCdu && aisleCdu.flowLpm < 105;
+      if (done) return { call: 'Done', tone: 'ok', when: 'fixed and verified' };
+      if (rackDown) return { call: 'YES', tone: 'bad', when: 'servers are already offline' };
+      if (eta >= 0 && eta <= 10) return { call: 'YES', tone: 'bad', when: eta === 0 ? 'already past the limit' : `shutdown in ${etaTxt.toLowerCase()}` };
+      if (oneFeed || coolingBad) return { call: 'Soon', tone: 'warn', when: 'no backup left — one more fault and it drops' };
+      if (eta > 10) return { call: 'Soon', tone: 'warn', when: `about ${Math.round(eta)} min of room` };
+      return { call: 'Can wait', tone: 'info', when: 'stable, backup still in place' };
+    })();
+
+    // What is actually affected, and what state it is in right now.
+    const hit = (() => {
+      const ids = (inc?.affectedRacks || w?.rackId || '').split(', ').filter(Boolean);
+      const downIds = ids.filter(id => racks.find(r => r.id === id)?.status === 'down');
+      if (downIds.length) return { what: downIds.join(', '), state: `${downIds.length > 1 ? 'these racks are' : 'this rack is'} offline`, bad: true, down: true };
+      if (w?.kind === 'cdu') {
+        const c = cdus.find(x => x.id === w.rackId);
+        return { what: `${w.rackId} + ${ids.length} rack${ids.length > 1 ? 's' : ''}`, state: c ? `${c.flowLpm.toFixed(0)} L/min coolant, racks heating` : '', bad: true, down: false };
+      }
+      if (w?.kind === 'pdu') return { what: w.rackId, state: rack ? `running on feed ${rack.pduAOnline ? 'A' : 'B'} only` : '', bad: true, down: false };
+      const km2 = w ? kindOf(w.kind) : undefined;
+      return { what: ids.join(', ') || (w?.rackId ?? ''), state: w && km2 && !reported ? `${fmt(w.kind, rack)} ${eta >= 0 ? 'and rising' : 'and steady'}` : 'reported by a tech', bad: eta >= 0 && eta <= 10, down: false };
+    })();
+
+    // Who feels it, and how forgiving they are likely to be.
+    const cust = (() => {
+      if (!tenantRows.length) return { name: 'None mapped', note: 'no tenant on these racks', hot: false };
+      const scored = tenantRows.map(r => ({ r, heat: Math.max(r.sig?.score ?? 0, r.tn?.flagLevel ?? 0) })).sort((a, b) => b.heat - a.heat);
+      const top = scored[0];
+      const extra = tenantRows.length - 1;
+      const note = top.heat >= 2 ? 'low tolerance — already in the news'
+        : top.heat === 1 ? 'already watching after a recent issue'
+        : top.r.tn?.tier === 'critical' ? 'critical tier — almost no downtime allowance'
+        : 'would be understanding';
+      return { name: `${top.r.name.split(' ').slice(0, 2).join(' ')}${extra ? ` +${extra}` : ''}`, note, hot: top.heat >= 2 };
+    })();
 
     const action = () => {
       if (!w) return null;
@@ -820,10 +903,10 @@ export default function App() {
     };
 
     const tabs: { id: typeof incTab; label: string; n?: number }[] = [
-      { id: 'overview', label: 'What to do' },
-      { id: 'impact', label: 'Impact' },
-      { id: 'routing', label: 'Who & why', n: chain.length || undefined },
-      { id: 'log', label: 'Log' },
+      { id: 'overview', label: 'Diagnosis & fix' },
+      { id: 'impact', label: 'Business impact' },
+      { id: 'routing', label: 'Escalation', n: chain.length || undefined },
+      { id: 'log', label: 'Audit trail' },
     ];
 
     return (
@@ -871,20 +954,25 @@ export default function App() {
               </div>
 
               <div className={`strip ${done ? 'done' : ''}`}>
-                <div className={`cell ${!done && eta >= 0 && eta <= 10 ? 'bad' : ''}`}>
-                  <div className="cell-l">Time to critical</div>
-                  <div className="cell-v">{done ? '—' : etaTxt}</div>
-                  <div className="cell-s">{reading || (done ? 'resolved' : '')}</div>
+                <div className={`cell big ${urg.tone}`}>
+                  <div className="cell-l">Drop everything?</div>
+                  <div className={`cell-v verdict-v ${urg.tone}`}>{urg.call}</div>
+                  <div className="cell-s">{urg.when}</div>
+                </div>
+                <div className={`cell ${hit.bad ? 'bad' : ''}`}>
+                  <div className="cell-l">{hit.down ? "What's down" : "What's affected"}</div>
+                  <div className="cell-v sm">{hit.what}</div>
+                  <div className="cell-s">{hit.state}</div>
                 </div>
                 <div className={`cell ${!done && inc?.slaAtRisk ? 'warn' : ''}`}>
                   <div className="cell-l">Cost if down</div>
-                  <div className="cell-v">{inc?.costPerMinute ? `$${Math.round(inc.costPerMinute * 10).toLocaleString()}` : '—'}</div>
+                  <div className="cell-v">{inc?.costPerMinute ? `$${Math.round(inc.costPerMinute * 10).toLocaleString()}` : <span className="kpi-wait" />}</div>
                   <div className="cell-s">per 10 min{inc?.slaAtRisk ? ' · SLA at risk' : ''}</div>
                 </div>
-                <div className="cell">
-                  <div className="cell-l">Exposed</div>
-                  <div className="cell-v">{inc ? inc.affectedRacks.split(', ').filter(Boolean).length : 1} rack{inc && inc.affectedRacks.includes(',') ? 's' : ''}</div>
-                  <div className="cell-s">{tenantRows.length ? `${tenantRows.length} tenant${tenantRows.length > 1 ? 's' : ''}` : inc?.affectedRacks ?? w.rackId}</div>
+                <div className={`cell ${cust.hot ? 'bad' : ''}`}>
+                  <div className="cell-l">Customer</div>
+                  <div className="cell-v sm">{cust.name}</div>
+                  <div className="cell-s">{cust.note}</div>
                 </div>
                 <div className={`cell ${w.status === 'open' && !agentWorking ? 'bad' : ''}`}>
                   <div className="cell-l">{agentFixed || agentWorking ? 'Handled by' : w.claimedBy !== undefined ? 'Owner' : live?.status === 'queued' ? 'Holding for' : live ? 'Paging' : 'Owner'}</div>
@@ -939,34 +1027,66 @@ export default function App() {
               )}
 
               {incTab === 'impact' && (
-                <div className="panel">
-                  {inc ? (
-                    <>
-                      <p className="xs">{inc.ifUnfixed}</p>
-                      <div className="kv xs"><span>Racks</span><span>{inc.affectedRacks}</span></div>
-                      {tenantRows.length > 0 && (
-                        <table className="tenants">
-                          <thead><tr><th>Tenant</th><th>Tier</th><th>SLA</th><th>Right now</th></tr></thead>
-                          <tbody>
-                            {tenantRows.map(r => (
-                              <tr key={r.name}>
-                                <td><b>{r.name}</b><div className="faint xxs">{r.tn?.workload}</div></td>
-                                <td>{r.tn?.tier}</td>
-                                <td>{r.tn ? `${r.tn.slaPct}%` : ''}</td>
-                                <td className="xs">
-                                  {r.sig?.url
-                                    ? <><span className={`news-score s${r.sig.score}`}>{['normal', 'watch', 'hot'][r.sig.score]}</span> <a className="chain-link" href={r.sig.url} target="_blank" rel="noreferrer">{r.sig.headline}</a> <span className="faint">via {r.sig.company}</span></>
-                                    : r.tn?.flagNote ? <span className="warn-text">{r.tn.flagNote}</span> : <span className="faint">nothing flagged</span>}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      )}
-                      <p className="faint xxs">Sample tenants and assumed downtime rates. Headlines are real news about stand-in companies, not NMC² customers, scored by Nemotron.</p>
-                    </>
-                  ) : <p className="empty">No impact data for this one.</p>}
-                </div>
+                inc ? (
+                  <>
+                    <div className="icards">
+                        <div className="icard money">
+                          <div className="icard-l">If these racks go down</div>
+                          <div className="icard-v">{inc.costPerMinute ? `$${Math.round(inc.costPerMinute * 10).toLocaleString()}` : '0'}</div>
+                          <div className="icard-s">every 10 minutes</div>
+                          {inc.costPerMinute > 0 && <div className="icard-x">${Math.round(inc.costPerMinute * 60).toLocaleString()} an hour</div>}
+                        </div>
+                        <div className={`icard cust ${inc.slaAtRisk ? 'hot' : ''}`}>
+                          <div className="icard-l">Customers exposed</div>
+                          <div className="icard-v">{tenantRows.length}</div>
+                          <div className="icard-s">{tenantRows.map(r => r.name).join(', ') || 'none'}</div>
+                          {inc.slaAtRisk && <div className="icard-x hot">{tenantRows.filter(r => r.tn?.tier === 'critical').length} on a critical-tier SLA</div>}
+                        </div>
+                        <div className="icard rack">
+                          <div className="icard-l">Racks affected</div>
+                          <div className="icard-v">{inc.affectedRacks.split(', ').filter(Boolean).length}</div>
+                          <div className="icard-s">{inc.affectedRacks}</div>
+                          <div className="icard-x">{done ? 'back to normal' : eta >= 0 ? `critical in ${etaTxt.toLowerCase()}` : 'no deadline yet'}</div>
+                        </div>
+                      </div>
+                    <p className="xs muted ifline">{inc.ifUnfixed}</p>
+                    {tenantRows.length > 0 && (
+                      <div className="panel">
+                        <h3>Customer impact</h3>
+                          {tenantRows.map(r => {
+                            const v = tolerance(r.tn, r.sig);
+                            return (
+                              <div key={r.name} className={`vuln-row ${v.level}`}>
+                                <div className="vuln-head">
+                                  <div>
+                                    <b>{r.name}</b>
+                                    <span className="faint xxs"> · {r.tn?.workload} · {r.tn?.tier} tier</span>
+                                  </div>
+                                  <span className={`vuln-chip ${v.level}`}>{v.label}</span>
+                                </div>
+                                <div className="vuln-why">{v.why}</div>
+                                {v.reasons.length > 0 && (
+                                  <ul className="vuln-list">
+                                    {v.reasons.map((x, i) => <li key={i} className={x.bad ? 'bad' : ''}>{x.text}</li>)}
+                                  </ul>
+                                )}
+                                {v.refs.length > 0 && (
+                                  <div className="refs">
+                                    <span className="refs-l">Check it yourself</span>
+                                    {v.refs.slice(0, 4).map((x, i) => (
+                                      <a key={i} className="ref" href={x.url} target={x.url.startsWith('#') ? undefined : '_blank'} rel="noreferrer" title={x.sub} onClick={e => x.url.startsWith('#') && e.preventDefault()}>
+                                        {x.label} <span className="ref-go">↗</span>
+                                      </a>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </>
+                ) : <div className="panel"><p className="empty">No impact data for this one.</p></div>
               )}
 
               {incTab === 'routing' && (
@@ -977,15 +1097,51 @@ export default function App() {
                     <div className="pages">
                       {chain.map((p, i) => {
                         const t0 = techs.find(x => x.id === p.techId);
+                        const tr = w ? trackRecord(p.techId, w.kind) : undefined;
+                        const beaten = i === 0 && w
+                          ? techs.filter(x => x.id !== p.techId && x.role !== 'supervisor' && !chain.slice(0, i).some(c => c.techId === x.id))
+                              .map(x => ({ t: x, r: trackRecord(x.id, w.kind) }))
+                              .sort((a, b) => b.r.n - a.r.n)
+                              .filter(x => x.r.n < (tr?.n ?? 0) || x.t.shift !== t0?.shift)
+                              .slice(0, 2)
+                          : [];
                         return (
-                          <div key={p.id.toString()} className={`page-row ${p.status}`}>
-                            <span className="step-n">{i + 1}</span>
-                            <div className="avatar sm">{initials(nameOf(p.techId))}</div>
-                            <div className="grow">
-                              <div className="xs"><b>{nameOf(p.techId)}</b> <span className="muted">· {t0?.role} · {t0?.shift} shift</span></div>
-                              <div className="muted xxs">{p.reason}</div>
+                          <div key={p.id.toString()} className={`page-row col ${p.status}`}>
+                            <div className="row" style={{ width: '100%', gap: 10 }}>
+                              <span className="step-n">{i + 1}</span>
+                              <div className="avatar sm">{initials(nameOf(p.techId))}</div>
+                              <div className="grow">
+                                <div className="xs"><b>{nameOf(p.techId)}</b> <span className="muted">· {t0?.role} · {t0?.shift} shift · {w ? skillLine(p.techId, w.kind) : ''}</span></div>
+                                <div className="muted xxs">{p.status === 'acknowledged' ? `Acknowledged at ${clock(p.ackAt)}` : p.status === 'missed' ? `No answer within ${p.timeoutSec}s` : p.status === 'declined' ? 'Said they could not take it' : p.status === 'queued' ? 'Held for their shift' : `Paging now, ${p.timeoutSec}s to answer`}</div>
+                              </div>
+                              <Chip v={p.status} label={pageLabel(p)} />
                             </div>
-                            <Chip v={p.status} label={pageLabel(p)} />
+                            {tr && (
+                              <div className="rec">
+                                {tr.n > 0 ? (
+                                  <>
+                                    <div className="rec-sum">
+                                      <b>{tr.n}</b> {w ? (KIND_TITLE_SHORT[w.kind] ?? 'similar') : 'similar'} fix{tr.n > 1 ? 'es' : ''} on record
+                                      {tr.fast > 0 && <> · <b>{tr.fast}</b> done in under 15 min</>}
+                                      {tr.best > 0 && <> · fastest <b>{tr.best} min</b></>}
+                                    </div>
+                                    <ul className="rec-list">
+                                      {tr.fixes.slice(0, 3).map(f => <li key={f.id.toString()}>{f.daysAgo}d ago · {f.summary} <span className="faint">({f.minutes} min)</span></li>)}
+                                      {tr.live > 0 && <li className="ok-text">{tr.live} more fixed on this shift</li>}
+                                    </ul>
+                                  </>
+                                ) : <div className="rec-sum muted">No {w ? (KIND_TITLE_SHORT[w.kind] ?? 'similar') : ''} fixes on record — picked on skills and availability</div>}
+                                {beaten.length > 0 && (
+                                  <div className="rec-vs">
+                                    Picked over {beaten.map((x, j) => (
+                                      <span key={x.t.id.toString()}>
+                                        {j > 0 ? ' and ' : ''}<b>{x.t.name.split(' ')[0]}</b> ({x.t.shift !== t0?.shift ? `${x.t.shift} shift` : x.r.n === 0 ? `no ${w ? (KIND_TITLE_SHORT[w.kind] ?? 'similar') : ''} fixes` : `only ${x.r.n}, avg ${x.r.avg} min`})
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
                         );
                       })}
@@ -1444,6 +1600,55 @@ const css = `
   .kpi.cyan { border-color:rgba(34,211,238,.32); background:linear-gradient(160deg, rgba(34,211,238,.13), rgba(34,211,238,.03)); }
   .kpi.cyan .kpi-l { color:var(--cyan); } .kpi.cyan::after { background:var(--cyan); }
 
+  .refs { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:9px; padding-top:8px; border-top:1px solid var(--line); }
+  .refs-l { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--faint); margin-right:2px; }
+  .ref { font-size:11.5px; color:var(--info); text-decoration:none; border:1px solid var(--line2); border-radius:999px; padding:2px 10px; white-space:nowrap; }
+  .ref:hover { border-color:var(--info); background:rgba(106,161,255,.08); }
+  .ref-go { opacity:.6; font-size:10px; }
+  .icards { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-bottom:4px; }
+  .ifline { margin:0 0 14px; padding:0 2px; }
+  .icard { border:1px solid var(--line); border-radius:10px; padding:13px 16px; background:var(--panel); position:relative; overflow:hidden; }
+  .icard::before { content:''; position:absolute; left:0; top:0; bottom:0; width:3px; }
+  .icard.money::before { background:var(--warn); } .icard.cust::before { background:var(--info); } .icard.cust.hot::before { background:var(--bad); } .icard.rack::before { background:var(--violet); }
+  .icard-l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
+  .icard-v { font-size:26px; font-weight:600; letter-spacing:-.02em; font-variant-numeric:tabular-nums; margin:3px 0 1px; }
+  .icard.money .icard-v { color:var(--warn); }
+  .icard.cust.hot .icard-v { color:var(--bad); }
+  .icard-s { font-size:11.5px; color:var(--muted); line-height:1.4; }
+  .icard-x { font-size:11px; color:var(--faint); margin-top:5px; padding-top:5px; border-top:1px solid var(--line); }
+  .icard-x.hot { color:var(--bad); }
+  .page-row.col { flex-direction:column; align-items:stretch; gap:0; }
+  .rec { margin:8px 0 0 38px; padding:8px 12px; border-left:2px solid var(--line2); background:rgba(255,255,255,.015); border-radius:0 6px 6px 0; }
+  .rec-sum { font-size:11.5px; color:var(--muted); }
+  .rec-sum b { color:var(--text); }
+  .rec-list { margin:5px 0 0; padding-left:15px; font-size:11px; color:var(--muted); }
+  .rec-list li { padding:1px 0; }
+  .rec-vs { font-size:11px; color:var(--faint); margin-top:6px; padding-top:5px; border-top:1px solid var(--line); }
+  .rec-vs b { color:var(--muted); }
+  .vuln-row { border:1px solid var(--line); border-left-width:3px; border-radius:8px; padding:11px 14px; margin-bottom:8px; background:var(--panel2); }
+  .vuln-row.hot { border-left-color:var(--bad); }
+  .vuln-row.watch { border-left-color:var(--warn); }
+  .vuln-row.calm { border-left-color:var(--ok); }
+  .vuln-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+  .vuln-chip { font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; border-radius:4px; padding:2px 8px; white-space:nowrap; border:1px solid; }
+  .vuln-chip.hot { color:var(--bad); border-color:rgba(229,83,75,.5); background:rgba(229,83,75,.1); }
+  .vuln-chip.watch { color:var(--warn); border-color:rgba(224,164,58,.45); background:rgba(224,164,58,.08); }
+  .vuln-chip.calm { color:var(--ok); border-color:rgba(63,178,127,.4); background:rgba(63,178,127,.07); }
+  .vuln-why { font-size:12.5px; margin-top:5px; line-height:1.55; }
+  .vuln-list { margin:7px 0 0; padding-left:16px; font-size:11.5px; color:var(--muted); }
+  .vuln-list li { padding:1.5px 0; }
+  .vuln-list li.bad { color:var(--warn); }
+  .strip { grid-template-columns:repeat(5,1fr); }
+  .strip .cell.big { background:var(--panel2); }
+  .cell-v.verdict-v { font-size:24px; font-weight:700; letter-spacing:-.01em; }
+  .cell-v.verdict-v.bad { color:var(--bad); }
+  .cell-v.verdict-v.warn { color:var(--warn); }
+  .cell-v.verdict-v.info { color:var(--info); }
+  .cell-v.verdict-v.ok { color:var(--ok); }
+  .strip .cell.ok { box-shadow:inset 0 3px 0 var(--ok); }
+  .strip .cell.info { box-shadow:inset 0 3px 0 var(--info); }
+  .cell-v.sm { font-size:16px; line-height:1.3; white-space:normal; }
+  .cell-s { white-space:normal; }
   .onme { border:1px solid rgba(79,140,255,.45); border-radius:12px; background:linear-gradient(135deg, rgba(79,140,255,.12), rgba(79,140,255,.03)); padding:12px 16px 14px; margin-bottom:14px; }
   .onme-l { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:var(--accent); margin-bottom:8px; }
   .onme-row { display:flex; align-items:center; gap:12px; padding:9px 0; cursor:pointer; border-top:1px solid rgba(79,140,255,.18); }
@@ -1452,6 +1657,7 @@ const css = `
   .onme-badge.own { background:var(--accent); color:#fff; }
   .onme-t { font-size:14px; font-weight:600; }
   .onme-s { font-size:11.5px; color:var(--muted); }
+  .kpi-wait { display:inline-block; height:1em; }
   .kpi-of { font-size:14px; font-weight:500; color:var(--muted); }
   .kpi.red { border-color:rgba(229,83,75,.4); background:linear-gradient(160deg, rgba(229,83,75,.15), rgba(229,83,75,.03)); }
   .kpi.red .kpi-l { color:var(--bad); } .kpi.red::after { background:var(--bad); }

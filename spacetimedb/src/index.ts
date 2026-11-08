@@ -481,7 +481,7 @@ const SIM_SEC_PER_TICK = 3; // real time: one reading every 3 seconds, so 'minut
 const HOLD_BELOW_MIN = 10; // closer than this to critical: never wait for the best person
 const HOLD_GAP = 4;
 const AUTO_GRACE_SEC = 30; // how long the agent gets to fix a runaway job before a tech is paged // wait for an off-shift expert only if they beat the best on-shift tech by this much
-const ACK_TIMEOUT_SEC: Record<string, number> = { critical: 45, medium: 60, low: 90 };
+const ACK_TIMEOUT_SEC: Record<string, number> = { critical: 90, medium: 120, low: 180 };
 const LEVELS = ['low', 'medium', 'critical'];
 const NEEDED_SKILL: Record<string, string> = { cdu: 'cooling', cooling: 'cooling', humidity: 'cooling', pdu: 'electrical', power: 'electrical', network: 'network', disk: 'general', reported: 'general' };
 const KIND_TITLE: Record<string, string> = { cdu: 'coolant flow loss', cooling: 'overheating', power: 'power draw', disk: 'disk errors', network: 'packet loss', humidity: 'humidity', pdu: 'PDU feed loss', reported: 'reported issue' };
@@ -653,7 +653,7 @@ function updateIncidents(ctx: Ctx) {
       : eta > 0 ? `At the current rate it reaches critical in about ${fmtEta(eta)}.`
       : w.kind === 'pdu' ? 'No deadline yet, but the rack has no backup power: one more fault or a load rise takes it offline.'
       : 'No clear trend yet.';
-    const who = hit.length ? `${n} rack${n > 1 ? 's' : ''} and ${hit.map(x => x.t.name).join(', ')} exposed, about ${money(costPerMinute * 10)} per 10 min of downtime (assumed rates).` : `${n} rack${n > 1 ? 's' : ''} exposed.`;
+    const who = hit.length ? `${n} rack${n > 1 ? 's' : ''} and ${hit.map(x => x.t.name).join(', ')} exposed, about ${money(costPerMinute * 10)} per 10 min of downtime.` : `${n} rack${n > 1 ? 's' : ''} exposed.`;
     const ifUnfixed = `${when} ${who}`;
 
     // The most similar past fix, taken from whoever has the best record for this kind of fault.
