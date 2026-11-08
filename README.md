@@ -1,116 +1,48 @@
-Get a SpacetimeDB React app running in under 5 minutes.
+# Night Watch
 
-## Prerequisites
+A decentralized oracle network for data center operations, built for HackUTD 2026 (NMC² "Keep the World Running", with the Spacetime, Nvidia Nemotron and Solana tracks).
 
-- A recent version of [Node.js](https://nodejs.org/) 22, 24, or 26 or later
-- [SpacetimeDB CLI](https://spacetimedb.com/install) installed
+When a data center problem happens, the team has to decide who to call, what to fix first, and which customers are affected, and the record of what happened needs to be trustworthy. Night Watch helps them act on the right incident first. It brings in live news on each customer so the most at-risk ones come first, and it logs every page, assignment and fix on Solana so the record can't be changed. This improves time to owned and customer satisfaction.
 
-Install the [SpacetimeDB CLI](https://spacetimedb.com/install) before continuing.
+## Two goals
 
----
+**Customer satisfaction: the right incident first**
+- Live Google News headlines are pulled for each customer, and Nvidia Nemotron scores how upset that customer is likely to be. A customer already in the news gets a priority bump, so a small problem is treated as urgent.
+- Every incident shows time to critical, cost per 10 minutes, SLA risk and which customers are exposed.
+- The best-matched tech is paged by skill and past fixes. If they don't acknowledge in time, it escalates to the next person. When an incident can safely wait, it holds for the best person's next shift.
+- For power spikes, the agent fixes the problem itself and pages nobody.
 
-## Create your project
+**Security: a record that can't be changed**
+- Every page, claim, handoff and fix is written to Solana devnet (Memo program) as a sha256 fingerprint, signed by the people involved.
+- Each record includes the fingerprint of the one before it. The **Verify** button on the Audit trail tab recomputes the chain and flags any edit.
 
-Run the `spacetime dev` command to create a new project with a SpacetimeDB module and React client.
+Every diagnosis comes with a root cause, a runbook citation and a confidence score. A citation that doesn't match a real runbook step caps the confidence.
 
-This will start the local SpacetimeDB server, publish your module, generate TypeScript bindings, and start the React development server.
+## How it works
 
-```bash
-spacetime dev --template react-ts
-```
+| Piece | What it does |
+|---|---|
+| `spacetimedb/` | SpacetimeDB module: racks, cooling units, warnings, incidents, pages, escalation and a scheduled simulation tick every 3 seconds |
+| `agent/` | Nemotron agent: why-analysis, fix plans, self-fix for power spikes, news scoring |
+| `chain/` | Solana service: writes hash-linked, co-signed records to devnet |
+| `src/` | React and TypeScript dashboard, live from SpacetimeDB |
 
+## Demo notes
 
+- Customers, downtime rates and the technician roster are **sample data**. The news headlines are real, but about stand-in companies, not actual customers.
+- The Solana records are on **devnet**.
+- Problems can be triggered from the floor map. Break a rack's power feed (`pdu`), spike a rack's power, or fail a cooling unit's pump.
 
-## Open your app
+## Run it
 
-Navigate to [http://localhost:5173](http://localhost:5173) to see your app running.
+1. Install the [SpacetimeDB CLI](https://spacetimedb.com/install), and Node.js 22 or later.
+2. Install dependencies in the root, `agent/` and `chain/` with `npm install`.
+3. Publish the module: `cd spacetimedb && spacetime publish -y`.
+4. Put your key in `agent/.env` as `NVIDIA_API_KEY=...`, and set `SPACETIMEDB_DB_NAME` in `.env.local`.
+5. Start the agent: `cd agent && npm start`.
+6. Start the Solana service (optional, for signed records): `cd chain && npm start`.
+7. Start the dashboard: `npm run dev`, then open http://localhost:5173.
 
-The template includes a basic React app connected to SpacetimeDB.
+## What's next
 
-
-
-## Explore the project structure
-
-Your project contains both server and client code.
-
-Edit `spacetimedb/src/index.ts` to add tables and reducers. Edit `client/src/App.tsx` to build your UI.
-
-```
-my-spacetime-app/
-├── spacetimedb/          # Your SpacetimeDB module
-│   └── src/
-│       └── index.ts      # Server-side logic
-├── client/               # React frontend
-│   └── src/
-│       ├── App.tsx
-│       └── module_bindings/  # Auto-generated types
-└── package.json
-```
-
-
-
-## Understand tables and reducers
-
-Open `spacetimedb/src/index.ts` to see the module code. The template includes a `person` table and two reducers: `add` to insert a person, and `sayHello` to greet everyone.
-
-Tables store your data. Reducers are functions that modify data — they're the only way to write to the database.
-
-```typescript
-import { schema, table, t } from 'spacetimedb/server';
-
-const spacetimedb = schema({
-  person: table(
-    { public: true },
-    {
-      name: t.string(),
-    }
-  ),
-});
-export default spacetimedb;
-
-export const add = spacetimedb.reducer(
-  { name: t.string() },
-  (ctx, { name }) => {
-    ctx.db.person.insert({ name });
-  }
-);
-
-export const sayHello = spacetimedb.reducer(ctx => {
-  for (const person of ctx.db.person.iter()) {
-    console.info(`Hello, ${person.name}!`);
-  }
-  console.info('Hello, World!');
-});
-```
-
-
-
-## Test with the CLI
-
-Open a new terminal and navigate to your project directory. Then use the SpacetimeDB CLI to call reducers and query your data directly.
-
-```bash
-cd my-spacetime-app
-
-# Call the add reducer to insert a person
-spacetime call add Alice
-
-# Query the person table
-spacetime sql "SELECT * FROM person"
- name
----------
- "Alice"
-
-# Call sayHello to greet everyone
-spacetime call say_hello
-
-# View the module logs
-spacetime logs
-2025-01-13T12:00:00.000000Z  INFO: Hello, Alice!
-2025-01-13T12:00:00.000000Z  INFO: Hello, World!
-```
-
-## Next steps
-
-- See the [Chat App Tutorial](https://spacetimedb.com/docs/tutorials/chat-app) for a complete example
-- Read the [TypeScript SDK Reference](https://spacetimedb.com/docs/clients/typescript) for detailed API docs
+Real telemetry and customer data in place of the sample tenants, phone pings with bonus payouts for fast responses, and moving the audit trail from devnet to mainnet.
