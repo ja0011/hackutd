@@ -53,7 +53,13 @@ function walletFor(techName: string): Keypair {
 }
 
 // ─── solana ───────────────────────────────────────────────
-const solana = new Connection(RPC, 'confirmed');
+// We handle rate limits ourselves (one record at a time + backoff), so turn off the library's
+// own retry storm, which is what got us "429 Too Many Requests" and a crash.
+const solana = new Connection(RPC, { commitment: 'confirmed', disableRetryOnRateLimit: true });
+
+// Never let one failed network call take the whole service down.
+process.on('unhandledRejection', e => console.error('⚠️  Network hiccup (will retry):', (e as Error)?.message ?? e));
+process.on('uncaughtException', e => console.error('⚠️  Unexpected error (still running):', e.message));
 
 async function ensureFunded() {
   let bal = 0;
@@ -85,7 +91,6 @@ function safe(p: unknown) {
     });
   }
 }
-const inFlight = new Set<bigint>();
 
 function fingerprint(rec: {
   id: bigint; kind: string; refId: bigint; techIds: bigint[]; summary: string;
@@ -102,11 +107,46 @@ function fingerprint(rec: {
   return createHash('sha256').update(canonical).digest('hex');
 }
 
-async function writeRecord(conn: DbConnection, recordId: bigint) {
-  if (inFlight.has(recordId)) return;
+// One-at-a-time queue: devnet's free server rate-limits bursts, so records go out in order with a short gap.
+const queue: bigint[] = [];
+let draining = false;
+let backoffMs = 0;
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+function enqueue(conn: DbConnection, recordId: bigint) {
   const rec = conn.db.chainRecord.id.find(recordId);
-  if (!rec || rec.txSignature) return;
-  inFlight.add(recordId);
+  if (!rec || rec.txSignature || queue.includes(recordId)) return;
+  queue.push(recordId);
+  void drain(conn);
+}
+
+async function drain(conn: DbConnection) {
+  if (draining) return;
+  draining = true;
+  try {
+    while (queue.length) {
+      if (backoffMs) {
+        console.log(`⏸️  Solana is rate-limiting us, waiting ${Math.round(backoffMs / 1000)}s (${queue.length} record(s) queued)…`);
+        await sleep(backoffMs);
+      }
+      const id = queue[0];
+      const ok = await writeRecord(conn, id);
+      if (ok === 'rate-limited') {
+        backoffMs = Math.min(60_000, Math.max(5_000, backoffMs * 2));
+        continue; // keep it at the front and try again after the wait
+      }
+      queue.shift();
+      backoffMs = 0;
+      await sleep(1_200); // be polite to the free devnet server
+    }
+  } finally {
+    draining = false;
+  }
+}
+
+async function writeRecord(conn: DbConnection, recordId: bigint): Promise<'ok' | 'skip' | 'failed' | 'rate-limited'> {
+  const rec = conn.db.chainRecord.id.find(recordId);
+  if (!rec || rec.txSignature) return 'skip';
   try {
     // The techs involved co-sign the memo, so the signature on-chain proves who it was.
     const signers = rec.techIds
@@ -123,11 +163,21 @@ async function writeRecord(conn: DbConnection, recordId: bigint) {
     const sig = await sendAndConfirmTransaction(solana, new Transaction().add(ix), [payer, ...signers]);
     safe(conn.reducers.setTxSignature({ recordId, txSignature: sig }));
     console.log(`⛓️  ${rec.kind} #${recordId} on-chain → https://explorer.solana.com/tx/${sig}?cluster=devnet`);
+    return 'ok';
   } catch (e) {
-    console.error(`❌ Could not write record #${recordId}:`, (e as Error).message);
-  } finally {
-    inFlight.delete(recordId);
+    const msg = (e as Error).message ?? String(e);
+    if (msg.includes('429') || /too many requests/i.test(msg)) return 'rate-limited';
+    if (/prior credit|insufficient/i.test(msg)) {
+      console.error(`❌ Company wallet is out of devnet SOL. Add some at https://faucet.solana.com (address: ${payer.publicKey.toBase58()})`);
+      return 'rate-limited'; // wait and retry instead of hammering
+    }
+    console.error(`❌ Could not write record #${recordId}: ${msg.split('\n')[0]} (will retry)`);
+    return 'failed';
   }
+}
+
+function retryPending(conn: DbConnection) {
+  for (const rec of conn.db.chainRecord.iter()) if (!rec.txSignature) enqueue(conn, rec.id);
 }
 
 const walletSent = new Map<bigint, string>();
@@ -142,9 +192,6 @@ function syncWallets(conn: DbConnection) {
   }
 }
 
-function retryPending(conn: DbConnection) {
-  for (const rec of conn.db.chainRecord.iter()) if (!rec.txSignature) void writeRecord(conn, rec.id);
-}
 
 await ensureFunded();
 
@@ -155,7 +202,7 @@ DbConnection.builder()
   .onConnect((conn, _identity, token) => {
     writeFileSync(TOKEN_FILE, token);
     console.log(`🔌 Connected to Spacetime database ${DB_NAME}`);
-    conn.db.chainRecord.onInsert((_ctx, rec) => void writeRecord(conn, rec.id));
+    conn.db.chainRecord.onInsert((_ctx, rec) => enqueue(conn, rec.id));
     conn.db.tech.onInsert(() => syncWallets(conn));
     conn
       .subscriptionBuilder()

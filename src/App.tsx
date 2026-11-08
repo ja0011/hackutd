@@ -274,6 +274,21 @@ export default function App() {
   const Overview = () => {
     const crit = racks.filter(r => r.status === 'critical' || r.status === 'down').length;
     const warn = racks.filter(r => r.status === 'warning').length;
+    const racksOnline = racks.filter(r => r.status !== 'down').length;
+    const redundant = racks.filter(r => r.pduAOnline && r.pduBOnline).length;
+    const cdusOk = cdus.filter(c => c.status === 'ok').length;
+    const lastIncident = allWarnings[0];
+    // Unclaimed critical first, then by severity, then oldest first.
+    const sevRank: Record<string, number> = { critical: 0, medium: 1, low: 2 };
+    const queue = [...active].sort((a, b) => {
+      const ua = a.status === 'open' && a.severity === 'critical' ? 0 : 1;
+      const ub = b.status === 'open' && b.severity === 'critical' ? 0 : 1;
+      if (ua !== ub) return ua - ub;
+      const sr = (sevRank[a.severity] ?? 3) - (sevRank[b.severity] ?? 3);
+      if (sr) return sr;
+      if ((a.status === 'open') !== (b.status === 'open')) return a.status === 'open' ? -1 : 1;
+      return a.id < b.id ? -1 : 1;
+    });
     return (
       <>
         <div className="page-head row between wrap"><div><h1>Overview</h1><p className="muted">Live floor status · updates every 3 seconds</p></div><button className="primary" onClick={() => setShowReport(true)}>+ Report issue</button></div>
@@ -291,23 +306,76 @@ export default function App() {
             <div className="panel-head" style={{ marginTop: 16 }}><h3>Liquid cooling (CDUs)</h3><span className="muted xxs">Each CDU pumps coolant to every rack in its aisle</span></div>
             <div className="rack-grid">{sortedCdus.map(c => cduCard(c))}</div>
           </div>
-          <div className="panel">
-            <div className="panel-head"><h3>Needs attention</h3></div>
-            {active.length === 0 && <p className="empty">All clear.</p>}
-            {active.map(w => (
-              <button key={w.id.toString()} className="list-item" onClick={() => openWarning(w.id)}>
-                <div className="row between"><b>{w.rackId} · {kindOf(w.kind).title}</b><Chip v={w.severity} /></div>
-                <div className="muted xs clamp">{w.message}</div>
-                <div className="row between xs"><span className="muted">{ago(w.createdAt)}</span><Chip v={w.status} label={w.status === 'open' ? 'unclaimed' : w.status} /></div>
-              </button>
-            ))}
-            <div className="panel-head" style={{ marginTop: 16 }}><h3>Recent activity</h3></div>
-            {sortedRecords.slice(0, 5).map(rec => (
-              <div key={rec.id.toString()} className="activity">
-                <span className="dot" /> <div><div className="xs">{rec.summary}</div><div className="muted xxs">{clock(rec.createdAt)}</div></div>
+          <div className="side-col">
+            <div className="panel">
+              <div className="panel-head"><h3>Floor status</h3></div>
+              <div className="status-grid">
+                <div className={`status-cell ${racksOnline < racks.length ? 'bad' : ''}`}>
+                  <div className="status-num">{racksOnline}/{racks.length}</div>
+                  <div className="status-lbl">Racks online</div>
+                </div>
+                <div className={`status-cell ${redundant < racks.length ? 'warn' : ''}`}>
+                  <div className="status-num">{redundant}/{racks.length}</div>
+                  <div className="status-lbl">Dual PDU feeds</div>
+                </div>
+                <div className={`status-cell ${cdusOk < cdus.length ? 'bad' : ''}`}>
+                  <div className="status-num">{cdusOk}/{cdus.length}</div>
+                  <div className="status-lbl">CDUs healthy</div>
+                </div>
+                <div className="status-cell">
+                  <div className="status-num">{lastIncident ? ago(lastIncident.createdAt).replace(' ago', '') : '—'}</div>
+                  <div className="status-lbl">Since last incident</div>
+                </div>
               </div>
-            ))}
-            {records.length === 0 && <p className="empty">No activity yet.</p>}
+            </div>
+
+            <div className="panel queue">
+              <div className="panel-head">
+                <h3>Open issues <span className="count">{active.length}</span></h3>
+                {active.length > 0 && <button className="link" onClick={() => setView('warnings')}>View all</button>}
+              </div>
+              {queue.map(w => (
+                <div key={w.id.toString()} className={`q-row sev-${w.severity}`} onClick={() => openWarning(w.id)}>
+                  <div className="q-main">
+                    <div className="q-title">
+                      <b>{w.rackId}</b>
+                      <span>{kindOf(w.kind).title}</span>
+                      {w.source === 'agent' && <span className="q-tag">AI</span>}
+                    </div>
+                    <div className="q-msg">{w.message}</div>
+                    <div className="q-meta">
+                      <span className={`sev-text-${w.severity}`}>{w.severity}</span>
+                      <span>{ago(w.createdAt)}</span>
+                      <span>{w.claimedBy !== undefined ? nameOf(w.claimedBy) : 'Unassigned'}</span>
+                      {w.status === 'fixing' && <span>Verifying fix</span>}
+                    </div>
+                  </div>
+                  {w.status === 'open' && (
+                    <button className="q-claim" disabled={busy} onClick={e => { e.stopPropagation(); if (me) claimWarning({ warningId: w.id, techId: me.id }); }}>
+                      Claim
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="panel">
+              <div className="panel-head"><h3>Activity log</h3><button className="link" onClick={() => setView('record')}>Full record</button></div>
+              <div className="log">
+                {sortedRecords.slice(0, 6).map(rec => (
+                  <div key={rec.id.toString()} className="log-row">
+                    <span className="log-time">{clock(rec.createdAt).replace(/:\d\d (?=[AP]M)/, ' ')}</span>
+                    <span className="log-text">
+                      <span className="log-kind">{rec.kind === 'fix_verified' ? 'Verified' : rec.kind === 'claim' ? 'Claimed' : 'Handoff'}</span>
+                      {rec.summary}
+                    </span>
+                    <span className={`log-chain ${rec.txSignature ? 'on' : ''}`} title={rec.txSignature ? 'Written to Solana devnet' : 'Waiting to be written on-chain'}>
+                      {rec.txSignature ? 'On-chain' : 'Pending'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       </>
@@ -673,6 +741,40 @@ const css = `
   .fault-pick option { background:var(--panel); color:var(--text); }
   .grow { flex:1; min-width:140px; }
   .report { border-color:var(--line2); }
+  .side-col { display:flex; flex-direction:column; min-width:0; }
+  .status-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .status-cell { background:var(--panel2); padding:10px 12px; }
+  .status-num { font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-.01em; }
+  .status-lbl { font-size:11.5px; color:var(--muted); }
+  .status-cell.bad .status-num { color:var(--bad); }
+  .status-cell.warn .status-num { color:var(--warn); }
+  .count { display:inline-block; margin-left:6px; padding:0 6px; border-radius:4px; background:var(--panel2); border:1px solid var(--line2); color:var(--text); font-size:11px; letter-spacing:0; }
+  .queue .panel-head { margin-bottom:8px; }
+  .q-row { display:flex; gap:10px; align-items:center; padding:10px 10px 10px 12px; border:1px solid var(--line); border-left:3px solid var(--line2); border-radius:6px; background:var(--panel2); margin-bottom:6px; cursor:pointer; }
+  .q-row:hover { border-color:var(--line2); }
+  .q-row.sev-critical { border-left-color:var(--bad); }
+  .q-row.sev-medium { border-left-color:var(--warn); }
+  .q-row.sev-low { border-left-color:var(--info); }
+  .q-main { flex:1; min-width:0; }
+  .q-title { display:flex; gap:8px; align-items:baseline; font-size:13px; }
+  .q-title span { color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .q-tag { font-size:10px; font-weight:600; color:var(--info) !important; border:1px solid rgba(106,161,255,.4); border-radius:3px; padding:0 4px; }
+  .q-msg { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px; }
+  .q-meta { display:flex; gap:10px; font-size:11px; color:var(--faint); margin-top:4px; text-transform:none; }
+  .q-meta span + span::before { content:'·'; margin-right:10px; color:var(--line2); }
+  .sev-text-critical { color:var(--bad); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .sev-text-medium { color:var(--warn); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .sev-text-low { color:var(--info); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .q-claim { background:var(--accent); color:#fff; border:0; border-radius:5px; padding:6px 12px; font-weight:600; font-size:12px; cursor:pointer; flex-shrink:0; }
+  .q-claim:hover:not(:disabled) { background:var(--accent-d); }
+  .log { display:flex; flex-direction:column; }
+  .log-row { display:grid; grid-template-columns:62px 1fr auto; gap:10px; align-items:baseline; padding:7px 0; border-bottom:1px solid var(--line); font-size:12px; }
+  .log-row:last-child { border-bottom:0; }
+  .log-time { color:var(--faint); font-variant-numeric:tabular-nums; }
+  .log-text { color:var(--text); min-width:0; }
+  .log-kind { color:var(--muted); font-weight:600; margin-right:6px; }
+  .log-chain { font-size:10.5px; color:var(--faint); }
+  .log-chain.on { color:var(--ok); }
   .section { font-size:11.5px; margin:24px 0 10px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
 
   @media (max-width: 900px) {
