@@ -90,6 +90,18 @@ const RACK_FAULTS: { id: string; label: string }[] = [
   { id: 'pdu', label: 'Lose PDU A feed' },
   { id: 'power', label: 'Runaway job (agent fixes it)' },
 ];
+// What to bring and what can hurt you, per fault type — the site's standard kit list.
+const KIT: Record<string, { parts: string; hazard: string }> = {
+  cdu: { parts: 'Pump cartridge, bleed kit, drip tray', hazard: 'Hot coolant and pressurised loop — gloves and eye protection' },
+  pdu: { parts: 'Spare input cord, breaker key', hazard: 'Live electrical — lockout/tagout and arc-flash PPE' },
+  cooling: { parts: 'Fan tray, blanking panels', hazard: 'Hot aisle, 90°F+ — hydrate, do not work alone over 95°F' },
+  power: { parts: '', hazard: '' },
+  disk: { parts: 'Spare drive, SATA cable', hazard: '' },
+  network: { parts: 'Spare optic, fiber patch lead', hazard: '' },
+  humidity: { parts: 'Door seal, humidifier filter', hazard: '' },
+  reported: { parts: '', hazard: '' },
+};
+
 const kindOf = (k: string) => KINDS[k] ?? KINDS.reported;
 const fmt = (k: string, r?: RackRow) => {
   const m = kindOf(k);
@@ -146,10 +158,7 @@ export default function App() {
   const [tenants] = useTable(tables.tenant);
   const [floors] = useTable(tables.floor);
   const [links] = useTable(tables.chainLink);
-  const [experiments] = useTable(tables.experiment);
   const [signals] = useTable(tables.tenantSignal);
-  const startComparison = useReducer(reducers.startComparison);
-  const stopComparison = useReducer(reducers.stopComparison);
   const declinePage = useReducer(reducers.declinePage);
   const overridePriority = useReducer(reducers.overridePriority);
   const setShift = useReducer(reducers.setShift);
@@ -350,47 +359,6 @@ export default function App() {
     );
   };
 
-  const comparePanel = () => {
-    const ex = experiments.find(e => e.id === 'main');
-    const dur = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`);
-    const side = (warningId: bigint | undefined, cdu: string, label: string, paged: boolean) => {
-      const w = warningId ? warnings.find(x => x.id === warningId) : undefined;
-      const inc = w ? incidentOf(w.id) : undefined;
-      if (!w) return <div className="cmp-side"><div className="muted xxs">{label}</div><div className="cmp-big">—</div><div className="muted xs">Waiting for {cdu} to alarm…</div></div>;
-      const end = w.claimedAt ? toDate(w.claimedAt).getTime() : Date.now();
-      const secs = Math.max(0, Math.round((end - toDate(w.createdAt).getTime()) / 1000));
-      const cost = (inc?.costPerMinute ?? 0) * (secs / 60);
-      const missed = pagesOf(w.id).filter(p => p.status === 'missed' || p.status === 'declined').length;
-      return (
-        <div className={`cmp-side ${w.claimedAt ? 'done' : 'running'}`}>
-          <div className="muted xxs">{label} · {cdu}</div>
-          <div className="cmp-big">{dur(secs)}{!w.claimedAt && <span className="muted xxs"> and counting</span>}</div>
-          <div className="xs">{w.claimedAt ? `Owned by ${nameOf(w.claimedBy)}` : paged ? routingLine(w.id) || 'Paging…' : 'Nobody has been told'}{paged && missed ? ` · ${missed} page${missed > 1 ? 's' : ''} unanswered` : ''}</div>
-          <div className="muted xxs">≈ ${Math.round(cost).toLocaleString()} of exposure while unowned (assumed rates)</div>
-        </div>
-      );
-    };
-    if (!ex?.active)
-      return (
-        <div className="panel cmp idle">
-          <div className="row between wrap">
-            <div><h3 style={{ margin: 0 }}>Compare: old way vs Night Watch</h3><div className="muted xs">Breaks two CDUs at once. CDU-A is handled the old way (the alert just sits on the dashboard). CDU-C gets Night Watch paging and escalation.</div></div>
-            <button className="ghost sm" disabled={!connected} onClick={() => startComparison()}>Run comparison</button>
-          </div>
-        </div>
-      );
-    return (
-      <div className="panel cmp">
-        <div className="panel-head"><h3>Time to owned: old way vs Night Watch</h3><button className="link" onClick={() => stopComparison()}>End comparison</button></div>
-        <div className="cmp-grid">
-          {side(ex.baselineWarningId || undefined, ex.baselineCdu, 'Old way (no paging)', false)}
-          {side(ex.pagedWarningId || undefined, ex.pagedCdu, 'With Night Watch', true)}
-        </div>
-        <div className="muted xxs" style={{ marginTop: 8 }}>Demo comparison on simulated faults, not a field measurement. Act as the paged tech (bottom left) to acknowledge CDU-C.</div>
-      </div>
-    );
-  };
-
   // ─── views ───
   const Overview = () => {
     const crit = racks.filter(r => r.status === 'critical' || r.status === 'down').length;
@@ -426,10 +394,32 @@ export default function App() {
       : topPage ? `Holding for ${nameOf(topPage.techId)} next shift`
       : 'Nobody has it yet';
     const others = queue.length - 1;
-    const caughtEarly = allWarnings.filter(w => w.source === 'agent').length;
     const agentFixes = [...records].filter(r => r.kind === 'agent_action').length;
     const ownedTimes = allWarnings.filter(w => w.claimedAt).map(w => Math.round((toDate(w.claimedAt!).getTime() - toDate(w.createdAt).getTime()) / 1000));
     const ownedAvg = ownedTimes.length ? Math.round(ownedTimes.reduce((x, y) => x + y, 0) / ownedTimes.length) : 0;
+    const escalated = new Set(pages.filter(p => p.status === 'missed' || p.status === 'declined').map(p => p.warningId.toString())).size;
+    const triedNoAnswer = new Set(pages.filter(p => (p.status === 'missed' || p.status === 'declined') && active.some(w => w.id === p.warningId)).map(p => p.techId.toString())).size;
+    const beatLimit = allWarnings.filter(w => w.source === 'agent').length;
+    const totalRaised = allWarnings.length;
+    // On shift now, and what each person is carrying.
+    const roster = techs
+      .filter(t0 => t0.shift === shift || t0.role === 'supervisor')
+      .map(t0 => {
+        const paged = pages.find(p => p.techId === t0.id && p.status === 'paging');
+        const owns = active.filter(w => w.claimedBy === t0.id).length;
+        const missed = pages.filter(p => p.techId === t0.id && p.status === 'missed').length;
+        return { t: t0, paged, owns, missed, onShift: t0.shift === shift };
+      })
+      .sort((a, b) => (a.paged ? 0 : 1) - (b.paged ? 0 : 1) || b.owns - a.owns);
+    // My own work, first thing a tech looks for.
+    const minePaged = me ? pages.filter(p => p.techId === me.id && p.status === 'paging') : [];
+    const mineOwned = me ? active.filter(w => w.claimedBy === me.id) : [];
+    // Techs walk to a place, not to an alarm: group the queue by aisle.
+    const aisleOf = (w: (typeof active)[number]) => w.rackId.startsWith('CDU-') ? w.rackId.slice(-1) : racks.find(r => r.id === w.rackId)?.aisle ?? '?';
+    const roots = queue.filter(w => incidentOf(w.id)?.mode !== 'symptom');
+    const byAisle = [...new Set(roots.map(aisleOf))]
+      .map(a0 => ({ aisle: a0, items: roots.filter(w => aisleOf(w) === a0) }))
+      .sort((a, b) => (sevRank[prio(a.items[0])] ?? 3) - (sevRank[prio(b.items[0])] ?? 3));
 
     return (
       <>
@@ -438,6 +428,38 @@ export default function App() {
           <button className="primary" onClick={() => setShowReport(true)}>+ Report issue</button>
         </div>
         {reportForm()}
+
+        {(minePaged.length > 0 || mineOwned.length > 0) && (
+          <div className="onme">
+            <div className="onme-l">On you right now</div>
+            {minePaged.map(p => {
+              const w = warnings.find(x => x.id === p.warningId);
+              if (!w) return null;
+              const k = KIT[w.kind] ?? KIT.reported;
+              return (
+                <div key={`p${p.id}`} className="onme-row paged" onClick={() => openWarning(w.id)}>
+                  <span className="onme-badge">PAGED · {secsLeft(p)}s</span>
+                  <div className="grow">
+                    <div className="onme-t">Aisle {aisleOf(w)} · {w.rackId} · {kindOf(w.kind).title}</div>
+                    {k.parts && <div className="onme-s">Bring: {k.parts}</div>}
+                  </div>
+                  <button className="primary sm" disabled={busy} onClick={e => { e.stopPropagation(); me && claimWarning({ warningId: w.id, techId: me.id }); }}>Acknowledge</button>
+                  <button className="ghost sm" disabled={busy} onClick={e => { e.stopPropagation(); me && declinePage({ warningId: w.id, techId: me.id }); }}>Can't take it</button>
+                </div>
+              );
+            })}
+            {mineOwned.map(w => (
+              <div key={`o${w.id}`} className="onme-row" onClick={() => openWarning(w.id)}>
+                <span className="onme-badge own">YOURS</span>
+                <div className="grow">
+                  <div className="onme-t">Aisle {aisleOf(w)} · {w.rackId} · {kindOf(w.kind).title}</div>
+                  <div className="onme-s">{w.status === 'fixing' ? 'Fix submitted, waiting on the sensors' : 'Claimed, not fixed yet'}</div>
+                </div>
+                {w.status === 'claimed' && <button className="primary sm" disabled={busy} onClick={e => { e.stopPropagation(); me && markFixed({ warningId: w.id, techId: me.id }); }}>Mark fix done</button>}
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className={`hero ${heroTone}`}>
           {top ? (
@@ -475,70 +497,92 @@ export default function App() {
         </div>
 
         <div className="kpis">
-          <div className="kpi violet">
-            <div className="kpi-l">Caught early by Nemotron</div>
-            <div className="kpi-v">{caughtEarly}</div>
-            <div className="kpi-s">before they hit a limit</div>
-          </div>
-          <div className="kpi green">
-            <div className="kpi-l">Fixed by the agent</div>
-            <div className="kpi-v">{agentFixes}</div>
-            <div className="kpi-s">no technician needed</div>
-          </div>
           <div className="kpi amber">
             <div className="kpi-l">Time to owned</div>
             <div className="kpi-v">{ownedAvg ? `${ownedAvg}s` : '—'}</div>
-            <div className="kpi-s">{ownedAvg ? 'average, alert to owner' : 'nothing owned yet'}</div>
+            <div className="kpi-s">{ownedTimes.length ? `average over ${ownedTimes.length} incident${ownedTimes.length > 1 ? 's' : ''}` : 'alert until someone owns it'}</div>
           </div>
-          <div className="kpi cyan">
-            <div className="kpi-l">Signed on Solana</div>
-            <div className="kpi-v">{records.filter(r => r.txSignature).length}</div>
-            <div className="kpi-s">{records.filter(r => !r.txSignature).length} waiting to write</div>
+          <div className={`kpi ${escalated ? 'red' : 'green'}`}>
+            <div className="kpi-l">Had to escalate</div>
+            <div className="kpi-v">{escalated}<span className="kpi-of"> of {totalRaised}</span></div>
+            <div className="kpi-s">{escalated ? (triedNoAnswer ? `${triedNoAnswer} tech${triedNoAnswer === 1 ? '' : 's'} not answering right now` : 'all cleared since') : 'everyone answered first time'}</div>
+          </div>
+          <div className="kpi violet">
+            <div className="kpi-l">Caught before the limit</div>
+            <div className="kpi-v">{beatLimit}<span className="kpi-of"> of {totalRaised}</span></div>
+            <div className="kpi-s">flagged by Nemotron, not by a hard limit</div>
+          </div>
+          <div className="kpi green">
+            <div className="kpi-l">Fixed without a tech</div>
+            <div className="kpi-v">{agentFixes}</div>
+            <div className="kpi-s">agent resolved it alone</div>
           </div>
         </div>
 
-        {queue.length > 0 && (
+        <div className="roster">
+          <span className="roster-l">{shift === 'night' ? 'Night' : 'Day'} shift</span>
+          {roster.map(r => (
+            <span key={r.t.id.toString()} className={`who-chip ${r.paged ? 'paged' : r.owns ? 'busy' : r.onShift ? 'free' : 'off'}`} title={`${r.t.role}${r.onShift ? '' : ' · off shift'}${r.missed ? ` · missed ${r.missed}` : ''}`}>
+              <span className="who-dot" />{r.t.name.split(' ')[0]}
+              <em>{r.paged ? `paged ${secsLeft(r.paged)}s` : r.owns ? `${r.owns} open` : r.onShift ? 'free' : 'on call'}</em>
+            </span>
+          ))}
+          {pendingHandoffs.length > 0 && <button className="link roster-ho" onClick={() => setView('handoffs')}>{pendingHandoffs.length} handoff waiting to sign →</button>}
+        </div>
+
+        {roots.length > 0 && (
           <div className="panel queue">
             <div className="panel-head">
-              <h3>Open issues <span className="count">{queue.length}</span></h3>
+              <h3>What needs a visit <span className="count">{roots.length}</span></h3>
               <button className="link" onClick={() => setView('warnings')}>View all</button>
             </div>
-            {queue.filter(w => incidentOf(w.id)?.mode !== 'symptom').map(w => {
-              const i0 = incidentOf(w.id);
-              // Racks heating because this CDU failed: one quiet line, not a row each.
-              const kids = w.kind === 'cdu' ? queue.filter(x => incidentOf(x.id)?.mode === 'symptom' && incidentOf(x.id)?.decision.includes(w.rackId)) : [];
-              return (
-                <div key={`g${w.id}`}>
-                  <div className={`q-row sev-${prio(w)}`} onClick={() => openWarning(w.id)}>
-                    <div className="q-main">
-                      <div className="q-title">
-                        <b>{w.rackId}</b>
-                        <span>{kindOf(w.kind).title}</span>
-                        {w.source === 'agent' && <span className="q-tag">AI</span>}
+            {byAisle.map(g => (
+              <div key={g.aisle} className="aisle-group">
+                <div className="aisle-head">Aisle {g.aisle}<span className="muted xxs"> · {g.items.length} stop{g.items.length > 1 ? 's' : ''} on this walk</span></div>
+                {g.items.map(w => {
+                  const i0 = incidentOf(w.id);
+                  const k = KIT[w.kind] ?? KIT.reported;
+                  const kids = w.kind === 'cdu' ? queue.filter(x => incidentOf(x.id)?.mode === 'symptom' && incidentOf(x.id)?.decision.includes(w.rackId)) : [];
+                  return (
+                    <div key={w.id.toString()}>
+                      <div className={`q-row sev-${prio(w)}`} onClick={() => openWarning(w.id)}>
+                        <div className="q-main">
+                          <div className="q-title">
+                            <b>{w.rackId}</b>
+                            <span>{kindOf(w.kind).title}</span>
+                            {w.source === 'agent' && <span className="q-tag">AI</span>}
+                          </div>
+                          <div className="q-meta">
+                            <span className={`sev-text-${prio(w)}`}>{prio(w)}</span>
+                            <span>{ago(w.createdAt)}</span>
+                            <span>{w.claimedBy !== undefined ? nameOf(w.claimedBy) : routingLine(w.id) || 'Unassigned'}</span>
+                            {w.status === 'fixing' && <span>Verifying fix</span>}
+                          </div>
+                          {(k.parts || k.hazard) && i0?.mode !== 'auto' && (
+                            <div className="q-kit">
+                              {k.parts && <span className="kit-parts">Bring: {k.parts}</span>}
+                              {k.hazard && <span className="kit-haz">{k.hazard}</span>}
+                            </div>
+                          )}
+                        </div>
+                        {w.status === 'open' && i0?.mode === 'auto' && <span className="ai-tag">Agent fixing it</span>}
+                        {w.status === 'open' && i0?.mode !== 'auto' && (
+                          <button className="q-claim" disabled={busy} onClick={e => { e.stopPropagation(); if (me) claimWarning({ warningId: w.id, techId: me.id }); }}>
+                            Claim
+                          </button>
+                        )}
                       </div>
-                      <div className="q-meta">
-                        <span className={`sev-text-${prio(w)}`}>{prio(w)}</span>
-                        <span>{ago(w.createdAt)}</span>
-                        <span>{w.claimedBy !== undefined ? nameOf(w.claimedBy) : routingLine(w.id) || 'Unassigned'}</span>
-                        {w.status === 'fixing' && <span>Verifying fix</span>}
-                      </div>
+                      {kids.length > 0 && (
+                        <div className="q-kids" onClick={() => openWarning(kids[0].id)}>
+                          <span className="q-kids-br" />
+                          {kids.length} rack{kids.length > 1 ? 's' : ''} heating because of this ({kids.map(x => x.rackId).join(', ')}) · no separate page, clears when {w.rackId} is fixed
+                        </div>
+                      )}
                     </div>
-                    {w.status === 'open' && i0?.mode === 'auto' && <span className="ai-tag">Agent fixing it</span>}
-                    {w.status === 'open' && i0?.mode !== 'auto' && (
-                      <button className="q-claim" disabled={busy} onClick={e => { e.stopPropagation(); if (me) claimWarning({ warningId: w.id, techId: me.id }); }}>
-                        Claim
-                      </button>
-                    )}
-                  </div>
-                  {kids.length > 0 && (
-                    <div className="q-kids" onClick={() => openWarning(kids[0].id)}>
-                      <span className="q-kids-br" />
-                      {kids.length} rack{kids.length > 1 ? 's' : ''} heating because of this ({kids.map(k => k.rackId).join(', ')}) · no separate page, clears when {w.rackId} is fixed
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+                  );
+                })}
+              </div>
+            ))}
           </div>
         )}
 
@@ -607,7 +651,6 @@ export default function App() {
                 ))}
               </div>
             </div>
-            {comparePanel()}
           </div>
         </div>
       </>
@@ -1079,6 +1122,7 @@ export default function App() {
         {myPages.map(p => {
           const w = warnings.find(x => x.id === p.warningId);
           if (!w || w.status !== 'open') return null;
+          if (view === 'overview') return null; // 'On you right now' covers it
           if (view === 'warnings' && selected?.id === w.id) return null; // the incident page already has the button
           return (
             <div key={p.id.toString()} className="paged-banner">
@@ -1400,6 +1444,34 @@ const css = `
   .kpi.cyan { border-color:rgba(34,211,238,.32); background:linear-gradient(160deg, rgba(34,211,238,.13), rgba(34,211,238,.03)); }
   .kpi.cyan .kpi-l { color:var(--cyan); } .kpi.cyan::after { background:var(--cyan); }
 
+  .onme { border:1px solid rgba(79,140,255,.45); border-radius:12px; background:linear-gradient(135deg, rgba(79,140,255,.12), rgba(79,140,255,.03)); padding:12px 16px 14px; margin-bottom:14px; }
+  .onme-l { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:var(--accent); margin-bottom:8px; }
+  .onme-row { display:flex; align-items:center; gap:12px; padding:9px 0; cursor:pointer; border-top:1px solid rgba(79,140,255,.18); }
+  .onme-row:first-of-type { border-top:0; }
+  .onme-badge { font-size:10px; font-weight:700; letter-spacing:.05em; border-radius:4px; padding:2px 7px; background:var(--warn); color:#0b0d10; white-space:nowrap; }
+  .onme-badge.own { background:var(--accent); color:#fff; }
+  .onme-t { font-size:14px; font-weight:600; }
+  .onme-s { font-size:11.5px; color:var(--muted); }
+  .kpi-of { font-size:14px; font-weight:500; color:var(--muted); }
+  .kpi.red { border-color:rgba(229,83,75,.4); background:linear-gradient(160deg, rgba(229,83,75,.15), rgba(229,83,75,.03)); }
+  .kpi.red .kpi-l { color:var(--bad); } .kpi.red::after { background:var(--bad); }
+  .roster { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; padding:9px 14px; border:1px solid var(--line); border-radius:9px; background:var(--panel); }
+  .roster-l { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-right:4px; }
+  .who-chip { display:inline-flex; align-items:center; gap:6px; font-size:12px; border:1px solid var(--line2); border-radius:999px; padding:3px 11px; }
+  .who-chip em { font-style:normal; font-size:10.5px; color:var(--muted); }
+  .who-dot { width:6px; height:6px; border-radius:50%; background:var(--faint); }
+  .who-chip.paged { border-color:rgba(224,164,58,.55); background:rgba(224,164,58,.1); }
+  .who-chip.paged .who-dot { background:var(--warn); } .who-chip.paged em { color:var(--warn); }
+  .who-chip.busy { border-color:rgba(106,161,255,.4); } .who-chip.busy .who-dot { background:var(--info); }
+  .who-chip.free .who-dot { background:var(--ok); }
+  .who-chip.off { opacity:.5; }
+  .roster-ho { margin-left:auto; color:var(--cyan); }
+  .aisle-group { margin-bottom:12px; }
+  .aisle-group:last-child { margin-bottom:0; }
+  .aisle-head { font-size:11.5px; font-weight:600; color:var(--text); margin:4px 0 6px; letter-spacing:.02em; }
+  .q-kit { display:flex; gap:14px; flex-wrap:wrap; margin-top:5px; font-size:11px; }
+  .kit-parts { color:var(--cyan); }
+  .kit-haz { color:var(--warn); }
   .aisle { display:flex; align-items:stretch; gap:10px; margin-bottom:8px; }
   .aisle-l { width:52px; flex-shrink:0; font-size:11.5px; color:var(--muted); align-self:center; }
   .cdu-chip { width:52px; flex-shrink:0; border-radius:7px; border:1px solid rgba(34,211,238,.3); background:rgba(34,211,238,.09); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1px; }
@@ -1431,12 +1503,6 @@ const css = `
   .log-chain.on { color:var(--cyan); }
   .nav.on { box-shadow:inset 2px 0 0 var(--violet); }
   .nav em { background:var(--bad); }
-  .cmp.idle { padding:12px 16px; }
-  .cmp-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-  .cmp-side { border:1px solid var(--line); border-radius:8px; padding:12px 14px; background:var(--panel2); }
-  .cmp-side.running { border-color:rgba(229,83,75,.5); }
-  .cmp-side.done { border-color:rgba(63,178,127,.45); }
-  .cmp-big { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; margin:2px 0; }
   .news { display:flex; gap:8px; align-items:baseline; margin-top:6px; }
   .news-score { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; border:1px solid var(--line2); border-radius:3px; padding:0 5px; color:var(--muted); flex-shrink:0; }
   .news-score.s1 { color:var(--warn); border-color:rgba(224,164,58,.4); }
