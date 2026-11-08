@@ -153,6 +153,143 @@ const chainRecord = table(
   }
 );
 
+// ── Escalation: skills, history, tenants, incidents, pages ────────────────
+// These are separate tables (not new columns on `tech`) so a republish keeps existing data.
+
+// What each tech is good at. skills: comma list of cooling | electrical | network | general | all
+const techProfile = table(
+  { name: 'tech_profile', public: true },
+  {
+    techId: t.u64().primaryKey(),
+    skills: t.string(),
+  }
+);
+
+// Past fixes (seeded team history). Used to rank who should be paged for a given kind of fault.
+const pastFix = table(
+  { name: 'past_fix', public: true },
+  {
+    id: t.u64().primaryKey().autoInc(),
+    techId: t.u64().index('btree'),
+    kind: t.string(),
+    minutes: t.u32(),
+    daysAgo: t.u32(),
+    summary: t.string(),
+  }
+);
+
+// Which shift is on the floor right now (demo can flip it).
+const floor = table({ name: 'floor', public: true }, { id: t.string().primaryKey(), currentShift: t.string() });
+
+// Sample tenants (demo data). Each rents some racks. flagLevel: 0 none, 1 watch, 2 hot.
+const tenant = table(
+  { name: 'tenant', public: true },
+  {
+    id: t.u64().primaryKey().autoInc(),
+    name: t.string(),
+    workload: t.string(),
+    tier: t.string(), // 'critical' | 'standard' | 'best-effort'
+    slaPct: t.f64(),
+    downtimeCostPerHour: t.f64(), // ASSUMED rate used for the cost estimate
+    rackIds: t.string(), // comma list
+    flagLevel: t.u32(),
+    flagNote: t.string(),
+  }
+);
+
+// One row per active warning: how urgent it is, who it hurts, what it costs, and the routing decision.
+const incident = table(
+  { name: 'incident', public: true },
+  {
+    warningId: t.u64().primaryKey(),
+    basePriority: t.string(),
+    priority: t.string(), // after customer-sensitivity bump or supervisor override
+    bumpReason: t.string(),
+    overriddenBy: t.option(t.u64()),
+    minutesToCritical: t.f64(), // -1 = no deadline detected
+    affectedRacks: t.string(),
+    tenants: t.string(),
+    costPerMinute: t.f64(),
+    slaAtRisk: t.bool(),
+    ifUnfixed: t.string(),
+    similarFix: t.string(),
+    mode: t.string(), // 'page_now' | 'holding'
+    decision: t.string(),
+  }
+);
+
+// The paging chain. status: queued | paging | acknowledged | missed | declined | skipped | superseded
+const page = table(
+  { name: 'page', public: true },
+  {
+    id: t.u64().primaryKey().autoInc(),
+    warningId: t.u64().index('btree'),
+    techId: t.u64(),
+    round: t.u32(),
+    status: t.string(),
+    pagedAt: t.timestamp(),
+    ackAt: t.option(t.timestamp()),
+    timeoutSec: t.u32(),
+    reason: t.string(),
+  }
+);
+
+// Nemotron's grounded root-cause analysis for a warning.
+const analysis = table(
+  { name: 'analysis', public: true },
+  {
+    warningId: t.u64().primaryKey(),
+    rootCause: t.string(),
+    evidence: t.string(),
+    runbook: t.string(), // e.g. "RB-CDU-01 step 3: ..."
+    confidence: t.u32(), // 0-100
+    callSenior: t.bool(),
+    createdAt: t.timestamp(),
+  }
+);
+
+// Hash links: each on-chain record carries the fingerprint of the record before it in the same
+// incident, so deleting or editing any event later breaks the chain. Written by the chain service.
+const chainLink = table(
+  { name: 'chain_link', public: true },
+  {
+    recordId: t.u64().primaryKey(),
+    chainKey: t.string(), // 'w:<warningId>' or 'h:<handoffId>'
+    sha256: t.string(),
+    prevSha256: t.string(), // '' for the first record in the chain
+  }
+);
+
+// With/without comparison: the same fault twice, one never paged (the old way), one with Night Watch.
+const experiment = table(
+  { name: 'experiment', public: true },
+  {
+    id: t.string().primaryKey(), // 'main'
+    active: t.bool(),
+    startedAt: t.timestamp(),
+    baselineCdu: t.string(),
+    pagedCdu: t.string(),
+    baselineWarningId: t.u64(), // 0 until the warning appears
+    pagedWarningId: t.u64(),
+  }
+);
+
+// Live news about a tenant (via an illustrative stand-in company), scored by Nemotron. Written by the agent.
+const tenantSignal = table(
+  { name: 'tenant_signal', public: true },
+  {
+    tenantId: t.u64().primaryKey(),
+    company: t.string(),
+    headline: t.string(),
+    url: t.string(),
+    source: t.string(),
+    publishedAt: t.string(),
+    score: t.u32(), // 0 none, 1 watch, 2 hot
+    note: t.string(),
+    checkedAt: t.timestamp(),
+  }
+);
+
 // Fires the sensor simulator every few seconds.
 const simTimer = table(
   { name: 'sim_timer' },
@@ -162,7 +299,7 @@ const simTimer = table(
   }
 );
 
-const spacetimedb = schema({ tech, rack, sensorReading, cdu, cduReading, warning, task, handoff, chainRecord, simTimer });
+const spacetimedb = schema({ tech, rack, sensorReading, cdu, cduReading, warning, task, handoff, chainRecord, techProfile, pastFix, floor, tenant, incident, page, analysis, chainLink, experiment, tenantSignal, simTimer });
 export default spacetimedb;
 
 type Ctx = ReducerCtx<InferSchema<typeof spacetimedb>>;
@@ -209,15 +346,69 @@ function levelFor(kind: SensorKind, v: number): 'ok' | 'medium' | 'critical' {
 }
 
 function seed(ctx: Ctx) {
-  const techs = [
-    { name: 'Alex Rivera', role: 'senior', shift: 'night' },
-    { name: 'Jordan Lee', role: 'junior', shift: 'night' },
-    { name: 'Sam Patel', role: 'senior', shift: 'day' },
-    { name: 'Morgan Diaz', role: 'supervisor', shift: 'day' },
-  ];
-  for (const x of techs) ctx.db.tech.insert({ id: 0n, walletPubkey: '', ...x });
-
+  seedTeam(ctx);
   seedRacks(ctx);
+}
+
+// ── Team, history and tenants (idempotent: safe to run on a database that already has some of it) ──
+const TEAM = [
+  { name: 'Alex Rivera', role: 'senior', shift: 'night', skills: 'cooling' },
+  { name: 'Jordan Lee', role: 'junior', shift: 'night', skills: 'general' },
+  { name: 'Sam Patel', role: 'senior', shift: 'day', skills: 'electrical' },
+  { name: 'Morgan Diaz', role: 'supervisor', shift: 'day', skills: 'all' },
+  { name: 'Priya Nair', role: 'mid', shift: 'night', skills: 'cooling' },
+  { name: 'Marcus Chen', role: 'mid', shift: 'night', skills: 'electrical' },
+  { name: 'Elena Voss', role: 'senior', shift: 'day', skills: 'network' },
+];
+
+// [tech, kind, minutes to fix, days ago, what was done]
+const HISTORY: [string, string, number, number, string][] = [
+  ['Alex Rivera', 'cdu', 11, 6, 'CDU-B pump seized: swapped the pump cartridge and bled the loop'],
+  ['Alex Rivera', 'cdu', 14, 19, 'CDU-A flow loss from a clogged strainer: cleaned it, flow restored'],
+  ['Alex Rivera', 'cdu', 11, 41, 'CDU-C pump controller fault: power-cycled it and replaced the fuse'],
+  ['Alex Rivera', 'cooling', 9, 12, 'R-12 fan tray failed: replaced the fan tray'],
+  ['Priya Nair', 'cdu', 19, 30, 'CDU-A low pressure: topped up coolant and bled trapped air'],
+  ['Priya Nair', 'cooling', 12, 8, 'R-16 blocked intake: cleared the blanking panel and reseated the baffle'],
+  ['Priya Nair', 'cooling', 15, 25, 'R-11 hot spot: re-aimed the perforated tile and fixed airflow'],
+  ['Jordan Lee', 'humidity', 8, 10, 'Aisle B humidity: closed a door seal and reset the humidifier'],
+  ['Jordan Lee', 'disk', 14, 22, 'R-15 disk errors: reseated the drive and swapped a cable'],
+  ['Sam Patel', 'pdu', 8, 3, 'R-14 lost PDU A: reset the upstream breaker and reseated the cord'],
+  ['Sam Patel', 'pdu', 9, 15, 'R-17 PDU B offline: replaced a failed PDU input module'],
+  ['Sam Patel', 'pdu', 10, 27, 'R-10 PDU A tripped: rebalanced load across both feeds'],
+  ['Sam Patel', 'pdu', 9, 50, 'R-13 PDU B cord damaged: replaced the power cord'],
+  ['Sam Patel', 'power', 13, 9, 'R-12 power spike: moved two servers to another circuit'],
+  ['Marcus Chen', 'pdu', 16, 21, 'R-18 PDU A offline: reseated the feed and cleared the fault'],
+  ['Marcus Chen', 'power', 11, 14, 'R-15 power draw high: rebalanced the load'],
+  ['Elena Voss', 'network', 10, 5, 'R-11 packet loss: replaced a faulty optic'],
+  ['Elena Voss', 'network', 12, 18, 'R-16 packet loss: swapped a damaged fiber patch'],
+  ['Elena Voss', 'network', 9, 40, 'R-13 packet loss: reseated the uplink'],
+  ['Elena Voss', 'disk', 15, 22, 'R-18 disk errors: replaced a failing drive'],
+];
+
+// Sample tenants (demo data, NOT real customers). downtimeCostPerHour is an assumed rate.
+const TENANTS = [
+  { name: 'Apex Racing Dynamics', workload: 'F1-style aerodynamics simulation', tier: 'critical', slaPct: 99.95, downtimeCostPerHour: 42000, rackIds: 'R-10,R-11', flagLevel: 2, flagNote: 'had an SLA breach 9 days ago' },
+  { name: 'Helix Therapeutics', workload: 'Drug discovery model training', tier: 'critical', slaPct: 99.99, downtimeCostPerHour: 65000, rackIds: 'R-12,R-13', flagLevel: 2, flagNote: 'has an open complaint about last month’s outage' },
+  { name: 'Sentinel Pay', workload: 'Fraud model inference', tier: 'critical', slaPct: 99.99, downtimeCostPerHour: 90000, rackIds: 'R-14', flagLevel: 0, flagNote: '' },
+  { name: 'Meridian Weather Lab', workload: 'Climate simulation', tier: 'standard', slaPct: 99.9, downtimeCostPerHour: 18000, rackIds: 'R-15,R-16', flagLevel: 0, flagNote: '' },
+  { name: 'Orbit Labs', workload: 'LLM fine-tuning', tier: 'standard', slaPct: 99.9, downtimeCostPerHour: 30000, rackIds: 'R-17', flagLevel: 1, flagNote: 'escalated to management last month' },
+  { name: 'Northgate University', workload: 'Research cluster', tier: 'best-effort', slaPct: 99.0, downtimeCostPerHour: 6000, rackIds: 'R-18', flagLevel: 0, flagNote: '' },
+];
+
+function seedTeam(ctx: Ctx) {
+  for (const m of TEAM) {
+    let row = [...ctx.db.tech.iter()].find(x => x.name === m.name);
+    if (!row) row = ctx.db.tech.insert({ id: 0n, name: m.name, role: m.role, shift: m.shift, walletPubkey: '' });
+    if (!ctx.db.techProfile.techId.find(row.id)) ctx.db.techProfile.insert({ techId: row.id, skills: m.skills });
+  }
+  if ([...ctx.db.pastFix.iter()].length === 0) {
+    for (const [name, kind, minutes, daysAgo, summary] of HISTORY) {
+      const who = [...ctx.db.tech.iter()].find(x => x.name === name);
+      if (who) ctx.db.pastFix.insert({ id: 0n, techId: who.id, kind, minutes, daysAgo, summary });
+    }
+  }
+  if ([...ctx.db.tenant.iter()].length === 0) for (const x of TENANTS) ctx.db.tenant.insert({ id: 0n, ...x });
+  if (!ctx.db.floor.id.find('main')) ctx.db.floor.insert({ id: 'main', currentShift: 'night' });
 }
 
 function seedRacks(ctx: Ctx) {
@@ -272,8 +463,378 @@ function newWarning(ctx: Ctx, rackId: string, kind: string, severity: string, me
 }
 
 function resolve(ctx: Ctx, w: NonNullable<ReturnType<Ctx['db']['warning']['id']['find']>>, summary: string, techIds: bigint[], verifiedBy?: bigint) {
+  for (const tk of [...ctx.db.task.warningId.filter(w.id)]) {
+    if (tk.executor === 'agent' && tk.status !== 'done' && tk.description.startsWith('Confirm')) ctx.db.task.id.update({ ...tk, status: 'done', result: summary });
+  }
   ctx.db.warning.id.update({ ...w, status: 'resolved', resolvedAt: ctx.timestamp, verifiedBy: verifiedBy ?? w.verifiedBy });
   ctx.db.chainRecord.insert({ id: 0n, kind: 'fix_verified', refId: w.id, techIds, summary, createdAt: ctx.timestamp, txSignature: '' });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Incident engine: time-to-impact, cost, priority, and who gets paged
+// ─────────────────────────────────────────────────────────────
+
+type Warning = NonNullable<ReturnType<Ctx['db']['warning']['id']['find']>>;
+type Incident = NonNullable<ReturnType<Ctx['db']['incident']['warningId']['find']>>;
+
+const SIM_SEC_PER_TICK = 3; // real time: one reading every 3 seconds, so 'minutes to critical' are real minutes
+const HOLD_BELOW_MIN = 10; // closer than this to critical: never wait for the best person
+const HOLD_GAP = 4;
+const AUTO_GRACE_SEC = 30; // how long the agent gets to fix a runaway job before a tech is paged // wait for an off-shift expert only if they beat the best on-shift tech by this much
+const ACK_TIMEOUT_SEC: Record<string, number> = { critical: 20, medium: 30, low: 45 };
+const LEVELS = ['low', 'medium', 'critical'];
+const NEEDED_SKILL: Record<string, string> = { cdu: 'cooling', cooling: 'cooling', humidity: 'cooling', pdu: 'electrical', power: 'electrical', network: 'network', disk: 'general', reported: 'general' };
+const KIND_TITLE: Record<string, string> = { cdu: 'coolant flow loss', cooling: 'overheating', power: 'power draw', disk: 'disk errors', network: 'packet loss', humidity: 'humidity', pdu: 'PDU feed loss', reported: 'reported issue' };
+
+const byId = (a: { id: bigint }, b: { id: bigint }) => (a.id < b.id ? -1 : 1);
+const money = (x: number) => '$' + String(Math.round(x)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const secondsBetween = (a: { microsSinceUnixEpoch: bigint }, b: { microsSinceUnixEpoch: bigint }) => Number(b.microsSinceUnixEpoch - a.microsSinceUnixEpoch) / 1e6;
+
+// Median change per reading over the last few readings (one sudden jump doesn't count as a trend).
+function trendPerTick(xs: number[]) {
+  const d: number[] = [];
+  for (let i = Math.max(1, xs.length - 8); i < xs.length; i++) d.push(xs[i] - xs[i - 1]);
+  if (d.length < 3) return 0; // too few readings to call it a trend
+  d.sort((a, b) => a - b);
+  return d[Math.floor(d.length / 2)];
+}
+const ticksToMin = (ticks: number) => (ticks * SIM_SEC_PER_TICK) / 60;
+// '40 s' under a minute, otherwise '3 min'.
+const fmtEta = (min: number) => (min < 1 ? `${Math.max(5, Math.round((min * 60) / 5) * 5)} s` : `${Math.round(min)} min`);
+// Smallest change per reading that counts as a real trend (anything less is sensor noise).
+const MIN_TREND: Record<SensorKind, number> = { cooling: 0.15, power: 0.08, disk: 0.5, network: 0.08, humidity: 0.2, pdu: 1.5 };
+
+// Rack overheating in an aisle whose CDU is failing is a symptom, not a separate incident,
+// even if the CDU's own alarm hasn't fired yet (its flow is already below normal).
+function rootCauseCdu(ctx: Ctx, w: Warning): { rackId: string } | undefined {
+  if (w.kind !== 'cooling') return undefined;
+  const r = ctx.db.rack.id.find(w.rackId);
+  if (!r) return undefined;
+  const id = `CDU-${r.aisle}`;
+  if ([...ctx.db.warning.rackId.filter(id)].some(x => x.kind === 'cdu' && x.status !== 'resolved')) return { rackId: id };
+  const c = ctx.db.cdu.id.find(id);
+  return c && (c.flowLpm < CDU.flow.ok || c.pressureKpa < CDU.pressure.ok) ? { rackId: id } : undefined;
+}
+
+function rackSeries(ctx: Ctx, rackId: string, kind: SensorKind) {
+  const rows = [...ctx.db.sensorReading.rackId.filter(rackId)].sort(byId).slice(-10);
+  return rows.map(x => SENSORS[kind].read(x as unknown as Rack));
+}
+
+// Minutes until a rack sensor reaches its critical limit at the current trend. 0 = already there, -1 = no deadline.
+function rackEta(ctx: Ctx, rackId: string, kind: SensorKind): number {
+  const r = ctx.db.rack.id.find(rackId);
+  if (!r) return -1;
+  const s = SENSORS[kind];
+  const now = s.read(r);
+  if (r.status === 'down' || now >= s.crit) return 0;
+  const slope = trendPerTick(rackSeries(ctx, rackId, kind));
+  if (slope <= MIN_TREND[kind]) return -1; // normal sensor noise, not a trend
+  return ticksToMin((s.crit - now) / slope);
+}
+
+function incidentEta(ctx: Ctx, w: Warning): number {
+  const cands: number[] = [];
+  if (w.kind === 'cdu') {
+    const c = ctx.db.cdu.id.find(w.rackId);
+    if (!c) return -1;
+    if (cduLevel(c) === 'critical') return 0;
+    const rs = [...ctx.db.cduReading.cduId.filter(c.id)].sort(byId).slice(-10);
+    const fs = trendPerTick(rs.map(x => x.flowLpm));
+    const ps = trendPerTick(rs.map(x => x.pressureKpa));
+    if (fs < -0.05) cands.push(ticksToMin((c.flowLpm - CDU.flow.crit) / -fs));
+    if (ps < -0.05) cands.push(ticksToMin((c.pressureKpa - CDU.pressure.crit) / -ps));
+    for (const r of ctx.db.rack.iter()) if (r.aisle === c.aisle) {
+      const e = rackEta(ctx, r.id, 'cooling');
+      if (e >= 0) cands.push(e);
+    }
+  } else if (isSensorKind(w.kind)) {
+    const e = rackEta(ctx, w.rackId, w.kind);
+    if (e >= 0) cands.push(e);
+  } else {
+    const r = ctx.db.rack.id.find(w.rackId);
+    if (r?.status === 'down') return 0;
+  }
+  return cands.length ? Math.min(...cands) : -1;
+}
+
+function affectedRackIds(ctx: Ctx, w: Warning): string[] {
+  if (w.kind === 'cdu') {
+    const c = ctx.db.cdu.id.find(w.rackId);
+    return c ? [...ctx.db.rack.iter()].filter(r => r.aisle === c.aisle).map(r => r.id) : [];
+  }
+  return [w.rackId];
+}
+
+function techHistory(ctx: Ctx, techId: bigint, kind: string) {
+  const fixes = [...ctx.db.pastFix.techId.filter(techId)].filter(f => f.kind === kind);
+  const avg = fixes.length ? Math.round(fixes.reduce((a, f) => a + f.minutes, 0) / fixes.length) : 0;
+  let live = 0; // fixes done during this run also count toward experience
+  for (const w of ctx.db.warning.iter()) if (w.status === 'resolved' && w.kind === kind && w.claimedBy === techId) live++;
+  return { n: fixes.length + live, avg };
+}
+
+// Everyone except supervisors, best match first: skill fit, then how many similar faults they have fixed.
+function rankTechs(ctx: Ctx, kind: string) {
+  const needed = NEEDED_SKILL[kind] ?? 'general';
+  return [...ctx.db.tech.iter()]
+    .filter(tc => tc.role !== 'supervisor')
+    .map(tc => {
+      const skills = (ctx.db.techProfile.techId.find(tc.id)?.skills ?? 'general').split(',');
+      const h = techHistory(ctx, tc.id, kind);
+      const fit = skills.includes(needed) ? 10 : skills.includes('general') ? 3 : 0;
+      const seniority = tc.role === 'senior' ? 2 : tc.role === 'mid' ? 1 : 0;
+      const score = fit + 3 * h.n + seniority - h.avg * 0.05;
+      const label = kind === 'reported' ? 'issue' : `${KIND_TITLE[kind] ?? kind}`;
+      const fitText = fit === 10 ? `${needed} specialist` : fit === 3 ? 'generalist' : `no ${needed} skills`;
+      const histText = h.n ? `${h.n} past ${label} fix${h.n > 1 ? 'es' : ''}${h.avg ? `, avg ${h.avg} min` : ''}` : `no past ${label} fixes`;
+      return { tech: tc, score, hist: h, why: `${fitText}, ${histText}` };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
+function currentShift(ctx: Ctx) {
+  return ctx.db.floor.id.find('main')?.currentShift ?? 'night';
+}
+
+// Recompute urgency, impact and priority for every unresolved warning (runs every tick).
+function updateIncidents(ctx: Ctx) {
+  const tenants = [...ctx.db.tenant.iter()];
+  for (const w of [...ctx.db.warning.iter()]) {
+    const existing = ctx.db.incident.warningId.find(w.id);
+    if (w.status === 'resolved' && existing) {
+      // Keep the incident as a record of what happened, frozen at the moment it was resolved.
+      if (existing.mode !== 'resolved') {
+        const act = w.claimedBy === undefined ? [...ctx.db.chainRecord.iter()].find(r => r.refId === w.id && r.kind === 'agent_action') : undefined;
+        const decision = act ? `Fixed by the Nemotron agent ${Math.round(secondsBetween(w.createdAt, act.createdAt))}s after the alert. Nobody was paged.` : existing.decision;
+        ctx.db.incident.warningId.update({ ...existing, mode: 'resolved', minutesToCritical: -1, decision });
+      }
+      continue;
+    }
+    if (existing?.mode === 'acknowledged') continue; // someone owns it; keep the routing record as it was
+    const racks = affectedRackIds(ctx, w);
+    const eta = incidentEta(ctx, w);
+
+    // Who is exposed, and what does an hour of downtime cost them (assumed rates)?
+    const hit: { t: (typeof tenants)[number]; share: number }[] = [];
+    for (const tn of tenants) {
+      const mine = tn.rackIds.split(',');
+      const overlap = mine.filter(id => racks.includes(id)).length;
+      if (overlap) hit.push({ t: tn, share: overlap / mine.length });
+    }
+    const costPerMinute = hit.reduce((a, x) => a + (x.t.downtimeCostPerHour / 60) * x.share, 0);
+    const slaAtRisk = hit.some(x => x.t.tier === 'critical');
+
+    // Customer sensitivity: an easy fix on a customer who is already upset gets bumped up.
+    // Two sources: the account history (flagLevel) and live news scored by Nemotron (tenant_signal).
+    const base = LEVELS.includes(w.severity) ? w.severity : 'medium';
+    let bump = 0;
+    let bumpReason = '';
+    for (const x of hit) {
+      const sig = ctx.db.tenantSignal.tenantId.find(x.t.id);
+      const newsWins = !!sig && sig.score > x.t.flagLevel;
+      const level = Math.min(2, newsWins ? sig!.score : x.t.flagLevel);
+      const b = Math.max(0, level - (x.t.tier === 'critical' ? 0 : 1));
+      if (b > bump) {
+        bump = b;
+        bumpReason = newsWins
+          ? `${x.t.name} (${x.t.tier} tier): live news via stand-in ${sig!.company}: "${sig!.headline}" (${sig!.source}). ${sig!.note.replace(/\.$/, "")}`
+          : `${x.t.name} (${x.t.tier} tier) ${x.t.flagNote}`;
+      }
+    }
+    let priority = LEVELS[Math.min(2, LEVELS.indexOf(base) + bump)];
+    const overriddenBy = existing?.overriddenBy;
+    if (overriddenBy !== undefined && existing) priority = existing.priority;
+    const reason = overriddenBy !== undefined && existing ? existing.bumpReason : priority !== base ? `Raised ${base} to ${priority}: ${bumpReason}.` : '';
+
+    const n = racks.length;
+    const when =
+      eta === 0 ? 'Already at the critical limit.'
+      : eta > 0 ? `At the current rate it reaches critical in about ${fmtEta(eta)}.`
+      : w.kind === 'pdu' ? 'No deadline yet, but the rack has no backup power: one more fault or a load rise takes it offline.'
+      : 'No clear trend yet.';
+    const who = hit.length ? `${n} rack${n > 1 ? 's' : ''} and ${hit.map(x => x.t.name).join(', ')} exposed, about ${money(costPerMinute * 10)} per 10 min of downtime (assumed rates).` : `${n} rack${n > 1 ? 's' : ''} exposed.`;
+    const ifUnfixed = `${when} ${who}`;
+
+    // The most similar past fix, taken from whoever has the best record for this kind of fault.
+    let similarFix = existing?.similarFix ?? '';
+    if (!existing) {
+      const best = rankTechs(ctx, w.kind).find(x => x.hist.n > 0);
+      const f = best ? [...ctx.db.pastFix.techId.filter(best.tech.id)].filter(p => p.kind === w.kind).sort((a, b) => a.daysAgo - b.daysAgo)[0] : undefined;
+      if (best && f) similarFix = `${best.tech.name}, ${f.daysAgo} days ago: ${f.summary} (took ${f.minutes} min)`;
+    }
+
+    const row: Incident = {
+      warningId: w.id,
+      basePriority: base,
+      priority,
+      bumpReason: reason,
+      overriddenBy,
+      minutesToCritical: eta,
+      affectedRacks: racks.join(', '),
+      tenants: hit.map(x => x.t.name).join(', '),
+      costPerMinute,
+      slaAtRisk,
+      ifUnfixed,
+      similarFix,
+      mode: existing?.mode ?? 'page_now',
+      decision: existing?.decision ?? '',
+    };
+    if (w.status === 'resolved') {
+      const act = [...ctx.db.chainRecord.iter()].find(r => r.refId === w.id && r.kind === 'agent_action');
+      row.mode = 'resolved';
+      row.minutesToCritical = -1;
+      row.decision = act ? `Fixed by the Nemotron agent ${Math.round(secondsBetween(w.createdAt, act.createdAt))}s after the alert. Nobody was paged.` : row.decision;
+    }
+    if (existing) ctx.db.incident.warningId.update(row);
+    else ctx.db.incident.insert(row);
+  }
+}
+
+// A moment that gets written to Solana by the chain service.
+function chainRec(ctx: Ctx, kind: string, refId: bigint, techIds: bigint[], summary: string) {
+  ctx.db.chainRecord.insert({ id: 0n, kind, refId, techIds, summary, createdAt: ctx.timestamp, txSignature: '' });
+}
+const techName = (ctx: Ctx, id: bigint) => ctx.db.tech.id.find(id)?.name ?? 'unknown';
+const incidentLabel = (w: Warning) => `${w.rackId} ${KIND_TITLE[w.kind] ?? w.kind}`;
+
+// Link the comparison's two CDU warnings once they appear.
+function linkExperiment(ctx: Ctx) {
+  const ex = ctx.db.experiment.id.find('main');
+  if (!ex || !ex.active || (ex.baselineWarningId && ex.pagedWarningId)) return;
+  const find = (cduId: string) =>
+    [...ctx.db.warning.rackId.filter(cduId)].find(w => w.kind === 'cdu' && w.createdAt.microsSinceUnixEpoch >= ex.startedAt.microsSinceUnixEpoch)?.id ?? 0n;
+  const b = ex.baselineWarningId || find(ex.baselineCdu);
+  const p = ex.pagedWarningId || find(ex.pagedCdu);
+  if (b !== ex.baselineWarningId || p !== ex.pagedWarningId) ctx.db.experiment.id.update({ ...ex, baselineWarningId: b, pagedWarningId: p });
+}
+function isBaseline(ctx: Ctx, warningId: bigint) {
+  const ex = ctx.db.experiment.id.find('main');
+  return !!ex && ex.active && ex.baselineWarningId === warningId;
+}
+
+// The paging chain: page the best match, escalate if nobody acknowledges, or hold for the best person when it can wait.
+function runEscalation(ctx: Ctx) {
+  const shift = currentShift(ctx);
+  for (const w of [...ctx.db.warning.iter()]) {
+    const pages = [...ctx.db.page.warningId.filter(w.id)].sort(byId);
+    // Fixed by the agent itself: nobody needs to be paged.
+    if (w.status !== 'open' && w.claimedBy === undefined && w.kind === 'power') {
+      for (const p of pages) if (p.status === 'paging' || p.status === 'queued') ctx.db.page.id.update({ ...p, status: 'skipped' });
+      const inc0 = ctx.db.incident.warningId.find(w.id);
+      const act = [...ctx.db.chainRecord.iter()].find(r => r.refId === w.id && r.kind === 'agent_action');
+      const d = `Fixed by the Nemotron agent ${act ? Math.round(secondsBetween(w.createdAt, act.createdAt)) : 0}s after the alert. Nobody was paged.`;
+      if (inc0 && inc0.mode !== 'resolved' && inc0.decision !== d) ctx.db.incident.warningId.update({ ...inc0, mode: inc0.mode === 'resolved' ? 'resolved' : 'auto', decision: d });
+      continue;
+    }
+    if (w.status !== 'open') {
+      for (const p of pages) if (p.status === 'paging' || p.status === 'queued') ctx.db.page.id.update({ ...p, status: 'skipped' });
+      // Replace the "Paging X" line with who took it and how long it took.
+      const inc = ctx.db.incident.warningId.find(w.id);
+      if (inc && inc.mode !== 'acknowledged' && inc.mode !== 'resolved' && inc.mode !== 'symptom') {
+        const owner = w.claimedBy !== undefined ? ctx.db.tech.id.find(w.claimedBy)?.name ?? 'a tech' : 'a tech';
+        const secs = w.claimedAt ? Math.round(secondsBetween(w.createdAt, w.claimedAt)) : 0;
+        const missed = pages.filter(p => p.status === 'missed' || p.status === 'declined').length;
+        const viaPage = pages.some(p => p.techId === w.claimedBy && p.status === 'acknowledged');
+        ctx.db.incident.warningId.update({
+          ...inc,
+          mode: 'acknowledged',
+          decision: `${owner} took it ${secs}s after the alert${viaPage ? ' when paged' : ' directly from the dashboard'}${missed ? `, after ${missed} page${missed > 1 ? 's' : ''} went unanswered` : ''}.`,
+        });
+      }
+      continue;
+    }
+    const inc = ctx.db.incident.warningId.find(w.id);
+    if (!inc) continue;
+
+    // Comparison baseline: the old way. The alert just sits on the dashboard; nobody is told.
+    // Hold paging while the agent can still fix it: the first 30 s, or until power nears the warning line.
+    const kw = ctx.db.rack.id.find(w.rackId)?.powerKw ?? 99;
+    if (w.kind === 'power' && (kw < 13 || (secondsBetween(w.createdAt, ctx.timestamp) < AUTO_GRACE_SEC && kw < 14))) {
+      const d = `The Nemotron agent is fixing this itself (moving the runaway job to a rack with spare power). A tech is paged only if it hasn't worked within ${AUTO_GRACE_SEC}s.`;
+      if (inc.mode !== 'auto') ctx.db.incident.warningId.update({ ...inc, mode: 'auto', decision: d });
+      continue;
+    }
+    if (isBaseline(ctx, w.id)) {
+      const d = 'Not paged: this is the comparison baseline (the old way). The alert waits on the dashboard until someone happens to notice it.';
+      if (inc.mode !== 'baseline') ctx.db.incident.warningId.update({ ...inc, mode: 'baseline', decision: d });
+      continue;
+    }
+
+    // Symptom of a failing CDU: the CDU page covers it, so nobody gets paged twice.
+    const cause = rootCauseCdu(ctx, w);
+    if (cause) {
+      for (const p of pages) if (p.status === 'paging' || p.status === 'queued') ctx.db.page.id.update({ ...p, status: 'superseded' });
+      const d = `Symptom of ${cause.rackId} coolant loss (root cause). Covered by that page, not paged separately. Clears when ${cause.rackId} is fixed.`;
+      if (inc.mode !== 'symptom' || inc.decision !== d) ctx.db.incident.warningId.update({ ...inc, mode: 'symptom', decision: d });
+      continue;
+    }
+
+    const eta = inc.minutesToCritical;
+    const urgent = inc.priority === 'critical' || (eta >= 0 && eta <= HOLD_BELOW_MIN);
+    const ranked = rankTechs(ctx, w.kind);
+    const onShift = ranked.filter(x => x.tech.shift === shift);
+    const best = ranked[0];
+    const bestOn = onShift[0];
+    // Once a real page has gone out, never go back to waiting.
+    const alreadyPaged = pages.some(p => p.timeoutSec > 0);
+    const wantHold = !alreadyPaged && !urgent && !!best && best.tech.shift !== shift && (!bestOn || best.score - bestOn.score >= HOLD_GAP);
+
+    let active = pages.find(p => p.status === 'paging' || p.status === 'queued');
+
+    if (wantHold && best) {
+      if (!active || active.techId !== best.tech.id) {
+        if (active) ctx.db.page.id.update({ ...active, status: 'superseded' });
+        const why = `${best.tech.name} (${best.tech.shift} shift): ${best.why}`;
+        ctx.db.page.insert({ id: 0n, warningId: w.id, techId: best.tech.id, round: 0, status: 'queued', pagedAt: ctx.timestamp, ackAt: undefined, timeoutSec: 0, reason: `best match: ${best.why}` });
+        chainRec(ctx, 'page_held', w.id, [], `${incidentLabel(w)} held for ${best.tech.name} (${best.tech.shift} shift, ${best.why}) instead of paging now.`);
+        const alt = bestOn ? ` Best on-shift option is ${bestOn.tech.name} (${bestOn.why}).` : '';
+        ctx.db.incident.warningId.update({ ...inc, mode: 'holding', decision: `Holding for ${why}.${alt} It can wait: ${eta < 0 ? 'no deadline detected' : `${fmtEta(eta)} to critical`}. Will page the on-shift team if it worsens or gets within ${HOLD_BELOW_MIN} min of critical.` });
+      }
+      continue;
+    }
+
+    // Not holding. A queued page (from an earlier hold) is replaced by the real chain.
+    if (active && active.status === 'queued') {
+      ctx.db.page.id.update({ ...active, status: 'superseded' });
+      active = undefined;
+    }
+
+    // Timed out without an acknowledgement: mark it missed so the next person is paged.
+    if (active && active.status === 'paging' && secondsBetween(active.pagedAt, ctx.timestamp) >= active.timeoutSec) {
+      ctx.db.page.id.update({ ...active, status: 'missed' });
+      chainRec(ctx, 'page_missed', w.id, [], `${techName(ctx, active.techId)} did not acknowledge the ${incidentLabel(w)} page within ${active.timeoutSec}s.`);
+      active = undefined;
+    }
+    if (active) continue;
+
+    // Chain: on-shift techs ranked, then supervisors as the last resort.
+    const chain = [
+      ...onShift.map(x => ({ tech: x.tech, why: x.why })),
+      ...[...ctx.db.tech.iter()].filter(tc => tc.role === 'supervisor').map(tc => ({ tech: tc, why: 'supervisor, last resort' })),
+    ];
+    if (!chain.length) continue;
+    const pagesNow = [...ctx.db.page.warningId.filter(w.id)];
+    let round = pagesNow.reduce((m, p) => Math.max(m, p.round), 0);
+    let tried = new Set(pagesNow.filter(p => p.round === round && p.status !== 'superseded' && p.status !== 'queued').map(p => p.techId));
+    let next = chain.find(c => !tried.has(c.tech.id));
+    if (!next) {
+      round += 1; // everyone missed it: start again from the top
+      tried = new Set();
+      next = chain[0];
+    }
+    const timeoutSec = ACK_TIMEOUT_SEC[inc.priority] ?? 30;
+    const pos = chain.findIndex(c => c.tech.id === next!.tech.id) + 1;
+    const after = chain[pos];
+    ctx.db.page.insert({ id: 0n, warningId: w.id, techId: next.tech.id, round, status: 'paging', pagedAt: ctx.timestamp, ackAt: undefined, timeoutSec, reason: next.why });
+    chainRec(ctx, 'paged', w.id, [], `Night Watch paged ${next.tech.name} for ${incidentLabel(w)} (${inc.priority} priority, ${next.why}); ${timeoutSec}s to acknowledge.`);
+    const skipped = best && best.tech.shift !== shift && urgent ? ` Not waiting for ${best.tech.name} (${best.tech.shift} shift, best match): ${eta >= 0 && eta <= HOLD_BELOW_MIN ? `only ${fmtEta(eta)} to critical` : 'priority is critical'}.` : '';
+    ctx.db.incident.warningId.update({
+      ...inc,
+      mode: 'page_now',
+      decision: `Paging ${next.tech.name} (${pos} of ${chain.length}): ${next.why}.${skipped} ${after ? `Escalates to ${after.tech.name} if not acknowledged in ${timeoutSec}s.` : 'Last in the chain.'}`,
+    });
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -297,16 +858,20 @@ const drift = (v: number, target: number, ctx: Ctx, noise: number, rate = 0.25) 
 const RECOVER = 0.6;
 
 export const simTick = spacetimedb.reducer({ onSchedule: simTimer }, { timer: simTimer.rowType }, (ctx, { timer: _timer }) => {
+  // A database that predates the team/tenant tables gets them filled in automatically.
+  if ([...ctx.db.techProfile.iter()].length < TEAM.length) seedTeam(ctx);
+
   // ── CDUs first: their health decides how hot the racks in their aisle run.
   const cduHealth = new Map<string, number>(); // aisle -> 0 (dead) .. 1 (healthy)
   for (const c of [...ctx.db.cdu.iter()]) {
     const flowLpm =
-      c.fault === 'pump' ? Math.max(8, c.flowLpm - 4 - ctx.random() * 2)
-      : c.fault === 'leak' ? Math.max(30, c.flowLpm - 2 - ctx.random() * 2)
+      // Real-time pace a person can follow: a pump failure loses ~40 L/min per minute.
+      c.fault === 'pump' ? Math.max(8, c.flowLpm - 1.6 - ctx.random() * 0.8)
+      : c.fault === 'leak' ? Math.max(30, c.flowLpm - 0.8 - ctx.random() * 0.6)
       : drift(c.flowLpm, 120, ctx, 2, RECOVER);
     const pressureKpa =
-      c.fault === 'leak' ? Math.max(40, c.pressureKpa - 5 - ctx.random() * 3)
-      : c.fault === 'pump' ? Math.max(90, c.pressureKpa - 3)
+      c.fault === 'leak' ? Math.max(40, c.pressureKpa - 2.2 - ctx.random() * 1.2)
+      : c.fault === 'pump' ? Math.max(90, c.pressureKpa - 1 - ctx.random() * 0.4)
       : drift(c.pressureKpa, 210, ctx, 3, RECOVER);
     const health = Math.min(1, Math.min(flowLpm / 120, pressureKpa / 210));
     const supplyTarget = 24 + (1 - health) * 18;
@@ -339,10 +904,10 @@ export const simTick = spacetimedb.reducer({ onSchedule: simTimer }, { timer: si
     const tempTarget = 72.5 + coolLoss * 26;
     const temperatureF =
       down ? drift(r.temperatureF, 70, ctx, 0.4)
-      : f === 'cooling' ? r.temperatureF + 0.6 + ctx.random() * 0.5
-      : f === 'power' ? r.temperatureF + 0.15 + ctx.random() * 0.1
+      : f === 'cooling' ? r.temperatureF + 0.28 + ctx.random() * 0.12 // fan failure: ~7°F per minute
+      : f === 'power' ? r.temperatureF + 0.06 + ctx.random() * 0.04
       : drift(r.temperatureF, tempTarget, ctx, 0.8, r.temperatureF > tempTarget + 1 ? RECOVER : 0.25);
-    const powerKw = down ? 0 : f === 'power' ? r.powerKw + 0.35 + ctx.random() * 0.3 : Math.max(5, drift(r.powerKw || 9, 9, ctx, 0.3, RECOVER));
+    const powerKw = down ? 0 : f === 'power' ? r.powerKw + 0.18 + ctx.random() * 0.08 : Math.max(5, drift(r.powerKw || 9, 9, ctx, 0.3, RECOVER));
     const humidityPct = f === 'humidity' ? r.humidityPct + 0.8 + ctx.random() * 0.6 : drift(r.humidityPct, 46, ctx, 0.6, r.humidityPct > 48 ? RECOVER : 0.25);
     const diskErrors = f === 'disk' ? r.diskErrors + 1 + Math.floor(ctx.random() * 3) : r.diskErrors;
     const packetLossPct = down ? 0 : f === 'network' ? r.packetLossPct + 0.3 + ctx.random() * 0.4 : Math.max(0, drift(r.packetLossPct, 0.1, ctx, 0.1, RECOVER));
@@ -418,6 +983,10 @@ export const simTick = spacetimedb.reducer({ onSchedule: simTimer }, { timer: si
       }
     }
   }
+
+  linkExperiment(ctx);
+  updateIncidents(ctx);
+  runEscalation(ctx);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -448,12 +1017,22 @@ export const claimWarning = spacetimedb.reducer({ warningId: t.u64(), techId: t.
   if (!w) throw new SenderError('Warning not found');
   if (w.status !== 'open') throw new SenderError('Warning already claimed');
   ctx.db.warning.id.update({ ...w, status: 'claimed', claimedBy: techId, claimedAt: ctx.timestamp });
+  // Claiming is the acknowledgement: it stops the escalation chain.
+  let acked = false;
+  for (const p of [...ctx.db.page.warningId.filter(warningId)]) {
+    if (p.status !== 'paging' && p.status !== 'queued') continue;
+    if (p.techId === techId) {
+      ctx.db.page.id.update({ ...p, status: 'acknowledged', ackAt: ctx.timestamp });
+      acked = true;
+    } else ctx.db.page.id.update({ ...p, status: 'skipped' });
+  }
+  const secs = Math.round(secondsBetween(w.createdAt, ctx.timestamp));
   ctx.db.chainRecord.insert({
     id: 0n,
     kind: 'claim',
     refId: warningId,
     techIds: [techId],
-    summary: `${who.name} took ownership of the ${w.rackId} ${w.kind === 'reported' ? 'reported issue' : 'warning'}.`,
+    summary: `${who.name} ${acked ? 'acknowledged the page and ' : ''}took ownership of the ${w.rackId} ${w.kind === 'reported' ? 'reported issue' : 'warning'} ${secs}s after the alert.`,
     createdAt: ctx.timestamp,
     txSignature: '',
   });
@@ -496,9 +1075,91 @@ export const verifyFix = spacetimedb.reducer({ warningId: t.u64(), techId: t.u64
   resolve(ctx, w, `${w.rackId} reported issue fixed by ${owner !== undefined ? ctx.db.tech.id.find(owner)?.name ?? '?' : '?'}, verified by ${who.name}.`, owner === undefined ? [techId] : [owner, techId], techId);
 });
 
+// "I can't take this one": the chain moves on to the next person right away.
+export const declinePage = spacetimedb.reducer({ warningId: t.u64(), techId: t.u64() }, (ctx, { warningId, techId }) => {
+  requireTech(ctx, techId);
+  const p = [...ctx.db.page.warningId.filter(warningId)].find(x => x.techId === techId && x.status === 'paging');
+  if (!p) throw new SenderError('You are not being paged for this');
+  ctx.db.page.id.update({ ...p, status: 'declined' });
+  const w = ctx.db.warning.id.find(warningId);
+  if (w) chainRec(ctx, 'page_declined', warningId, [techId], `${techName(ctx, techId)} declined the ${incidentLabel(w)} page, so it escalated.`);
+});
+
+// Start the side-by-side comparison: CDU-A is the baseline (never paged), CDU-C gets Night Watch.
+export const startComparison = spacetimedb.reducer(ctx => {
+  const ex = ctx.db.experiment.id.find('main');
+  if (ex?.active) throw new SenderError('A comparison is already running');
+  for (const id of ['CDU-A', 'CDU-C']) {
+    const c = ctx.db.cdu.id.find(id);
+    if (c) ctx.db.cdu.id.update({ ...c, fault: 'pump' });
+  }
+  const row = { id: 'main', active: true, startedAt: ctx.timestamp, baselineCdu: 'CDU-A', pagedCdu: 'CDU-C', baselineWarningId: 0n, pagedWarningId: 0n };
+  if (ex) ctx.db.experiment.id.update(row);
+  else ctx.db.experiment.insert(row);
+});
+
+export const stopComparison = spacetimedb.reducer(ctx => {
+  const ex = ctx.db.experiment.id.find('main');
+  if (ex) ctx.db.experiment.id.update({ ...ex, active: false });
+});
+
+// A supervisor can overrule the automatic priority.
+export const overridePriority = spacetimedb.reducer({ warningId: t.u64(), techId: t.u64(), priority: t.string() }, (ctx, { warningId, techId, priority }) => {
+  const who = requireTech(ctx, techId);
+  if (who.role !== 'supervisor') throw new SenderError('Only a supervisor can override priority');
+  if (!LEVELS.includes(priority)) throw new SenderError('Unknown priority');
+  const inc = ctx.db.incident.warningId.find(warningId);
+  if (!inc) throw new SenderError('Incident not found');
+  ctx.db.incident.warningId.update({ ...inc, priority, overriddenBy: techId, bumpReason: `Priority set to ${priority} by ${who.name} (supervisor override).` });
+});
+
+// Demo control: which shift is on the floor.
+export const setShift = spacetimedb.reducer({ shift: t.string() }, (ctx, { shift }) => {
+  if (shift !== 'day' && shift !== 'night') throw new SenderError('Shift must be day or night');
+  const f = ctx.db.floor.id.find('main');
+  if (f) ctx.db.floor.id.update({ ...f, currentShift: shift });
+  else ctx.db.floor.insert({ id: 'main', currentShift: shift });
+});
+
 // ─────────────────────────────────────────────────────────────
 // Agent actions
 // ─────────────────────────────────────────────────────────────
+
+// The agent files its root-cause analysis for a warning.
+// The agent fixes a runaway job by itself: move the workload to a rack with spare power.
+// Approved list of one action, only for power spikes, only to a healthy rack with headroom.
+export const agentMoveJob = spacetimedb.reducer({ warningId: t.u64(), targetRackId: t.string(), reason: t.string() }, (ctx, { warningId, targetRackId, reason }) => {
+  const w = ctx.db.warning.id.find(warningId);
+  if (!w) throw new SenderError('Warning not found');
+  if (w.kind !== 'power') throw new SenderError('The agent can only fix power spikes by itself');
+  if (w.status !== 'open') throw new SenderError('Already being handled');
+  const src = ctx.db.rack.id.find(w.rackId);
+  const dst = ctx.db.rack.id.find(targetRackId);
+  if (!src || !dst) throw new SenderError('Rack not found');
+  if (dst.id === src.id || dst.status !== 'ok' || dst.powerKw > 11) throw new SenderError(`${targetRackId} doesn't have spare power`);
+  if (src.powerKw < 12) throw new SenderError(`${src.id} is only at ${src.powerKw.toFixed(1)} kW; not clearly a runaway job yet`);
+  const before = src.powerKw;
+  ctx.db.rack.id.update({ ...src, fault: '' });
+  ctx.db.rack.id.update({ ...dst, powerKw: dst.powerKw + 1.5 });
+  ctx.db.warning.id.update({ ...w, status: 'fixing' });
+  const steps = [
+    { d: `Found what's driving the spike: a workload on ${src.id} pushing power to ${before.toFixed(1)} kW (normal is about 9).`, r: reason },
+    { d: `Moved that workload to ${dst.id}, which has the most spare power (${dst.powerKw.toFixed(1)} kW in use).`, r: 'Approved action: move a job to a healthy rack with headroom. Reversible.' },
+    { d: `Confirm ${src.id} power drops back under 12 kW.`, r: '' },
+  ];
+  steps.forEach((x, i) => ctx.db.task.insert({ id: 0n, warningId, stepNumber: i + 1, description: x.d, executor: 'agent', status: i < 2 ? 'done' : 'pending', result: x.r }));
+  chainRec(ctx, 'agent_action', warningId, [], `Nemotron agent moved the runaway job from ${src.id} (${before.toFixed(1)} kW) to ${dst.id}. No tech was paged.`);
+});
+
+export const setAnalysis = spacetimedb.reducer(
+  { warningId: t.u64(), rootCause: t.string(), evidence: t.string(), runbook: t.string(), confidence: t.u32(), callSenior: t.bool() },
+  (ctx, { warningId, rootCause, evidence, runbook, confidence, callSenior }) => {
+    if (!ctx.db.warning.id.find(warningId)) throw new SenderError('Warning not found');
+    const row = { warningId, rootCause, evidence, runbook, confidence: Math.min(100, confidence), callSenior, createdAt: ctx.timestamp };
+    if (ctx.db.analysis.warningId.find(warningId)) ctx.db.analysis.warningId.update(row);
+    else ctx.db.analysis.insert(row);
+  }
+);
 
 // The Nemotron agent raises an early warning before the hard rule trips.
 export const raiseWarning = spacetimedb.reducer(
@@ -604,6 +1265,30 @@ export const setTechWallet = spacetimedb.reducer({ techId: t.u64(), walletPubkey
   ctx.db.tech.id.update({ ...row, walletPubkey });
 });
 
+// The chain service records the transaction plus the hash link it wrote.
+export const setChainProof = spacetimedb.reducer(
+  { recordId: t.u64(), txSignature: t.string(), chainKey: t.string(), sha256: t.string(), prevSha256: t.string() },
+  (ctx, { recordId, txSignature, chainKey, sha256, prevSha256 }) => {
+    const rec = ctx.db.chainRecord.id.find(recordId);
+    if (!rec) throw new SenderError('Record not found');
+    ctx.db.chainRecord.id.update({ ...rec, txSignature });
+    const row = { recordId, chainKey, sha256, prevSha256 };
+    if (ctx.db.chainLink.recordId.find(recordId)) ctx.db.chainLink.recordId.update(row);
+    else ctx.db.chainLink.insert(row);
+  }
+);
+
+// The agent stores the latest news signal for a tenant.
+export const setTenantSignal = spacetimedb.reducer(
+  { tenantId: t.u64(), company: t.string(), headline: t.string(), url: t.string(), source: t.string(), publishedAt: t.string(), score: t.u32(), note: t.string() },
+  (ctx, args) => {
+    if (!ctx.db.tenant.id.find(args.tenantId)) throw new SenderError('Tenant not found');
+    const row = { ...args, score: Math.min(2, args.score), checkedAt: ctx.timestamp };
+    if (ctx.db.tenantSignal.tenantId.find(args.tenantId)) ctx.db.tenantSignal.tenantId.update(row);
+    else ctx.db.tenantSignal.insert(row);
+  }
+);
+
 export const setTxSignature = spacetimedb.reducer({ recordId: t.u64(), txSignature: t.string() }, (ctx, { recordId, txSignature }) => {
   const rec = ctx.db.chainRecord.id.find(recordId);
   if (!rec) throw new SenderError('Record not found');
@@ -637,13 +1322,25 @@ export const resetDemo = spacetimedb.reducer(ctx => {
   for (const x of [...ctx.db.sensorReading.iter()]) ctx.db.sensorReading.id.delete(x.id);
   for (const x of [...ctx.db.task.iter()]) ctx.db.task.id.delete(x.id);
   for (const x of [...ctx.db.warning.iter()]) ctx.db.warning.id.delete(x.id);
+  for (const x of [...ctx.db.incident.iter()]) ctx.db.incident.warningId.delete(x.warningId);
   for (const x of [...ctx.db.handoff.iter()]) ctx.db.handoff.id.delete(x.id);
   for (const x of [...ctx.db.chainRecord.iter()]) ctx.db.chainRecord.id.delete(x.id);
+  for (const x of [...ctx.db.page.iter()]) ctx.db.page.id.delete(x.id);
+  for (const x of [...ctx.db.chainLink.iter()]) ctx.db.chainLink.recordId.delete(x.recordId);
+  const exr = ctx.db.experiment.id.find('main');
+  if (exr) ctx.db.experiment.id.update({ ...exr, active: false, baselineWarningId: 0n, pagedWarningId: 0n });
+  for (const x of [...ctx.db.incident.iter()]) ctx.db.incident.warningId.delete(x.warningId);
+  for (const x of [...ctx.db.analysis.iter()]) ctx.db.analysis.warningId.delete(x.warningId);
+  const fl = ctx.db.floor.id.find('main');
+  if (fl) ctx.db.floor.id.update({ ...fl, currentShift: 'night' });
   for (const x of [...ctx.db.rack.iter()]) ctx.db.rack.id.delete(x.id);
   for (const x of [...ctx.db.cduReading.iter()]) ctx.db.cduReading.id.delete(x.id);
   for (const x of [...ctx.db.cdu.iter()]) ctx.db.cdu.id.delete(x.id);
   // Keep techs (and their wallets); only add them if missing.
   if ([...ctx.db.tech.iter()].length === 0) seed(ctx);
-  else seedRacks(ctx);
+  else {
+    seedTeam(ctx);
+    seedRacks(ctx);
+  }
   startTimer(ctx);
 });

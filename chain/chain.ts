@@ -137,6 +137,7 @@ async function drain(conn: DbConnection) {
       }
       queue.shift();
       backoffMs = 0;
+      if (ok === 'ok') retryPending(conn); // the next record in that incident's chain can go now
       await sleep(1_200); // be polite to the free devnet server
     }
   } finally {
@@ -144,9 +145,19 @@ async function drain(conn: DbConnection) {
   }
 }
 
+// Which hash chain a record belongs to: one chain per incident (warning) or per handoff.
+const chainKeyOf = (rec: { kind: string; refId: bigint }) => `${rec.kind === 'handoff' ? 'h' : 'w'}:${rec.refId}`;
+
 async function writeRecord(conn: DbConnection, recordId: bigint): Promise<'ok' | 'skip' | 'failed' | 'rate-limited'> {
   const rec = conn.db.chainRecord.id.find(recordId);
   if (!rec || rec.txSignature) return 'skip';
+  const key = chainKeyOf(rec);
+  // Records in one chain go out in order: wait until every earlier one in this chain is on-chain.
+  const earlier = [...conn.db.chainRecord.iter()].filter(r => r.id < rec.id && chainKeyOf(r) === key);
+  if (earlier.some(r => !r.txSignature)) return 'skip'; // picked up again by the 20s retry
+  const links = [...conn.db.chainLink.iter()].filter(l => l.chainKey === key && l.recordId < rec.id).sort((a, b) => (a.recordId < b.recordId ? 1 : -1));
+  const prev = links[0]?.sha256 ?? '';
+  const sha = fingerprint(rec);
   try {
     // The techs involved co-sign the memo, so the signature on-chain proves who it was.
     const signers = rec.techIds
@@ -154,15 +165,16 @@ async function writeRecord(conn: DbConnection, recordId: bigint): Promise<'ok' |
       .filter((x): x is NonNullable<typeof x> => !!x)
       .map(x => walletFor(x.name));
 
-    const memo = JSON.stringify({ app: 'night-watch', kind: rec.kind, ref: rec.refId.toString(), sha256: fingerprint(rec) });
+    // prev = fingerprint of the record before this one in the same incident, so the timeline can't be rewritten.
+    const memo = JSON.stringify({ app: 'night-watch', kind: rec.kind, ref: rec.refId.toString(), sha256: sha, prev });
     const ix = new TransactionInstruction({
       programId: MEMO_PROGRAM,
       keys: signers.map(k => ({ pubkey: k.publicKey, isSigner: true, isWritable: false })),
       data: Buffer.from(memo, 'utf8'),
     });
     const sig = await sendAndConfirmTransaction(solana, new Transaction().add(ix), [payer, ...signers]);
-    safe(conn.reducers.setTxSignature({ recordId, txSignature: sig }));
-    console.log(`⛓️  ${rec.kind} #${recordId} on-chain → https://explorer.solana.com/tx/${sig}?cluster=devnet`);
+    safe(conn.reducers.setChainProof({ recordId, txSignature: sig, chainKey: key, sha256: sha, prevSha256: prev }));
+    console.log(`⛓️  ${rec.kind} #${recordId} on-chain${prev ? ' (linked to previous)' : ''} → https://explorer.solana.com/tx/${sig}?cluster=devnet`);
     return 'ok';
   } catch (e) {
     const msg = (e as Error).message ?? String(e);
@@ -209,9 +221,9 @@ DbConnection.builder()
       .onApplied(() => {
         syncWallets(conn);
         retryPending(conn);
-        console.log('👀 Watching for claims, verified fixes and handoffs…');
+        console.log('👀 Watching for pages, claims, verified fixes and handoffs…');
       })
-      .subscribe(['SELECT * FROM chain_record', 'SELECT * FROM tech']);
+      .subscribe(['SELECT * FROM chain_record', 'SELECT * FROM tech', 'SELECT * FROM chain_link']);
     // Safety net: retry anything that failed (e.g. a devnet hiccup) every 20 seconds.
     setInterval(() => retryPending(conn), 20_000);
   })

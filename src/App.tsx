@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { tables, reducers } from './module_bindings';
 import { useSpacetimeDB, useTable, useReducer } from 'spacetimedb/react';
 
@@ -25,7 +25,48 @@ const tone: Record<string, string> = {
   low: 'blue', medium: 'amber',
   open: 'red', claimed: 'blue', fixing: 'amber', resolved: 'green',
   pending: 'amber', complete: 'green', in_progress: 'blue', done: 'green', failed: 'red',
+  paging: 'amber', acknowledged: 'green', missed: 'red', declined: 'red', skipped: 'gray', queued: 'blue',
+  page_now: 'amber', holding: 'blue', symptom: 'gray',
 };
+tone.acknowledged = 'green';
+tone.auto = 'blue';
+// How each kind of signed record reads in the logs.
+const REC_LABEL: Record<string, string> = { claim: 'Claimed', fix_verified: 'Verified', handoff: 'Handoff', paged: 'Paged', page_missed: 'Missed page', page_declined: 'Declined', page_held: 'Held', agent_action: 'Agent fixed' };
+const REC_TONE: Record<string, string> = { claim: 'claimed', fix_verified: 'resolved', handoff: 'complete', paged: 'paging', page_missed: 'missed', page_declined: 'declined', page_held: 'queued', agent_action: 'acknowledged' };
+
+// ─── timeline verification against Solana devnet ───
+const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function base58(s: string): Uint8Array {
+  let n = 0n;
+  for (const c of s) n = n * 58n + BigInt(B58.indexOf(c));
+  const bytes: number[] = [];
+  while (n > 0n) { bytes.unshift(Number(n % 256n)); n /= 256n; }
+  for (const c of s) { if (c === '1') bytes.unshift(0); else break; }
+  return new Uint8Array(bytes);
+}
+// Same fingerprint the chain service writes (chain/chain.ts).
+async function fingerprint(rec: { id: bigint; kind: string; refId: bigint; techIds: bigint[]; summary: string; createdAt: Micros }) {
+  const canonical = JSON.stringify({ id: rec.id.toString(), kind: rec.kind, refId: rec.refId.toString(), techIds: rec.techIds.map(String), summary: rec.summary, at: rec.createdAt.microsSinceUnixEpoch.toString() });
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function memoOf(sig: string): Promise<{ sha256?: string; prev?: string } | null> {
+  const res = await fetch('https://api.devnet.solana.com', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTransaction', params: [sig, { encoding: 'json', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }] }),
+  });
+  const j = await res.json();
+  const msg = j?.result?.transaction?.message;
+  if (!msg) return null;
+  const ix = msg.instructions.find((i: { programIdIndex: number }) => msg.accountKeys[i.programIdIndex] === MEMO_PROGRAM);
+  return ix ? JSON.parse(new TextDecoder().decode(base58(ix.data))) : null;
+}
+type Check = { recordId: string; ok: boolean; note: string };
+
+const PAGE_LABEL: Record<string, string> = { queued: 'waiting for shift', acknowledged: 'acknowledged', missed: 'no answer', declined: 'declined', skipped: 'not needed' };
+const MODE_LABEL: Record<string, string> = { page_now: 'Paging now', holding: 'Holding for best person', symptom: 'Symptom of root cause', acknowledged: 'Acknowledged', resolved: 'Resolved', auto: 'Agent fixing it' };
 const Chip = ({ v, label }: { v: string; label?: string }) => (
   <span className={`chip ${tone[v] ?? 'gray'}`}>{(label ?? v).replace('_', ' ')}</span>
 );
@@ -42,14 +83,12 @@ const KINDS: Record<string, { title: string; emoji: string; label: string; unit:
   cdu: { title: 'CDU coolant failure', emoji: '', label: 'Coolant flow', unit: ' L/min', warn: 90, ok: 105, digits: 0 },
   reported: { title: 'Reported issue', emoji: '', label: '', unit: '', warn: 0, ok: 0, digits: 0 },
 };
-// Rack-level faults you can simulate (CDU faults live on the CDU cards).
+// Rack-level faults you can simulate (the CDU pump failure lives on the CDU cards).
+// The demo focuses on three faults: CDU pump failure, PDU feed loss and thermal drift.
 const RACK_FAULTS: { id: string; label: string }[] = [
-  { id: 'cooling', label: 'Fan / airflow failure' },
-  { id: 'power', label: 'Power draw spike (overload)' },
+  { id: 'cooling', label: 'Thermal drift (fan failure)' },
   { id: 'pdu', label: 'Lose PDU A feed' },
-  { id: 'disk', label: 'Failing disk' },
-  { id: 'network', label: 'Bad network cable' },
-  { id: 'humidity', label: 'Humidity rising' },
+  { id: 'power', label: 'Runaway job (agent fixes it)' },
 ];
 const kindOf = (k: string) => KINDS[k] ?? KINDS.reported;
 const fmt = (k: string, r?: RackRow) => {
@@ -86,13 +125,7 @@ function Sparkline({ values, h = 32 }: { values: number[]; h?: number }) {
   );
 }
 
-const Stat = ({ label, value, sub, t }: { label: string; value: ReactNode; sub?: string; t?: string }) => (
-  <div className={`stat ${t ?? ''}`}>
-    <div className="stat-label">{label}</div>
-    <div className="stat-value">{value}</div>
-    {sub && <div className="stat-sub">{sub}</div>}
-  </div>
-);
+// (Stat tiles were replaced by the hero banner and the compact strip.)
 
 // ─── app ──────────────────────────────────────────────────
 export default function App() {
@@ -107,6 +140,19 @@ export default function App() {
   const [records] = useTable(tables.chainRecord);
   const [cdus] = useTable(tables.cdu);
   const [cduReadings] = useTable(tables.cduReading);
+  const [incidents] = useTable(tables.incident);
+  const [pages] = useTable(tables.page);
+  const [analyses] = useTable(tables.analysis);
+  const [tenants] = useTable(tables.tenant);
+  const [floors] = useTable(tables.floor);
+  const [links] = useTable(tables.chainLink);
+  const [experiments] = useTable(tables.experiment);
+  const [signals] = useTable(tables.tenantSignal);
+  const startComparison = useReducer(reducers.startComparison);
+  const stopComparison = useReducer(reducers.stopComparison);
+  const declinePage = useReducer(reducers.declinePage);
+  const overridePriority = useReducer(reducers.overridePriority);
+  const setShift = useReducer(reducers.setShift);
 
   const claimWarning = useReducer(reducers.claimWarning);
   const markFixed = useReducer(reducers.markFixed);
@@ -121,7 +167,7 @@ export default function App() {
   const [view, setView] = useState<View>('overview');
   const [, setNow] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => setNow(n => n + 1), 5000); // refresh "x ago" labels
+    const id = setInterval(() => setNow(n => n + 1), 1000); // refresh "x ago" labels and page countdowns
     return () => clearInterval(id);
   }, []);
 
@@ -133,6 +179,26 @@ export default function App() {
   const me = techs.find(x => x.id.toString() === actingId);
   const nameOf = (id?: bigint) => techs.find(x => x.id === id)?.name ?? '—';
   const busy = !connected || !me;
+
+  // ─── escalation / incident data ───
+  const shift = floors.find(f => f.id === 'main')?.currentShift ?? 'night';
+  const incidentOf = (id: bigint) => incidents.find(i => i.warningId === id);
+  const analysisOf = (id: bigint) => analyses.find(a => a.warningId === id);
+  const pagesOf = (id: bigint) => [...pages].filter(p => p.warningId === id && p.status !== 'superseded').sort((a, b) => (a.id < b.id ? -1 : 1));
+  const tenantOf = (rackId: string) => tenants.find(tn => tn.rackIds.split(',').includes(rackId));
+  const secsLeft = (p: { timeoutSec: number; pagedAt: Micros }) => Math.max(0, p.timeoutSec - Math.floor((Date.now() - toDate(p.pagedAt).getTime()) / 1000));
+  const myPages = me ? [...pages].filter(p => p.techId === me.id && p.status === 'paging') : [];
+  const pageLabel = (p: { status: string; timeoutSec: number; pagedAt: Micros }) => (p.status === 'paging' ? `paging · ${secsLeft(p)}s` : PAGE_LABEL[p.status] ?? p.status);
+  // One line for the queue: who is being paged right now, or why nobody is.
+  const routingLine = (id: bigint) => {
+    const inc = incidentOf(id);
+    if (!inc) return '';
+    if (inc.mode === 'symptom') return 'Symptom: covered by the CDU page';
+    if (inc.mode === 'auto') return 'Nemotron agent fixing it';
+    const cur = pagesOf(id).find(p => p.status === 'paging' || p.status === 'queued');
+    if (!cur) return '';
+    return cur.status === 'queued' ? `Holding for ${nameOf(cur.techId)}` : `Paging ${nameOf(cur.techId)} · ${secsLeft(cur)}s`;
+  };
 
   const sortedRacks = useMemo(() => [...racks].sort((a, b) => a.id.localeCompare(b.id)), [racks]);
   const sortedCdus = [...cdus].sort((a, b) => a.id.localeCompare(b.id));
@@ -209,34 +275,45 @@ export default function App() {
     const m = kindOf(fk);
     const down = r.status === 'down';
     const oneFeed = r.pduAOnline !== r.pduBOnline;
+    // Only say something when something is wrong. A healthy rack shows its tenant and nothing else.
+    const alerts = [
+      ...(down ? ['No power'] : oneFeed ? [`PDU ${r.pduAOnline ? 'B' : 'A'} down`] : []),
+      ...SENSOR_KEYS.filter(k => k !== fk && (kindOf(k).read?.(r) ?? 0) >= kindOf(k).warn).map(k => `${kindOf(k).label} ${fmt(k, r)}`),
+    ];
+    const tenant = tenantOf(r.id);
     return (
-      <div key={r.id} className={`rack ${tone[r.status]} ${down ? 'down' : ''}`}>
+      <div key={r.id} className={`rack ${tone[r.status]} ${down ? 'down' : ''} ${big ? 'big' : ''}`}>
         <div className="row between">
           <b>{r.id}</b>
-          <Chip v={r.status} label={down ? 'power lost' : r.status} />
+          {r.status === 'ok' ? <span className="dot ok" /> : <Chip v={r.status} label={down ? 'power lost' : r.status} />}
         </div>
         {down ? (
           <div className="rack-temp red-text">OFFLINE</div>
         ) : (
           <div className="rack-temp">{m.read?.(r).toFixed(m.digits)}<span>{m.unit || ' errors'}</span></div>
         )}
-        <div className="muted xxs">{down ? 'Both PDU feeds down' : m.label}</div>
-        <div className="spark"><Sparkline values={historyFor(r.id, fk)} h={big ? 44 : 30} /></div>
-        <div className={`pdu-row ${oneFeed || down ? 'red-text' : ''}`} title="Power Distribution Units: each server is plugged into both A and B">
-          PDU A {pduText(r.pduAOnline, r.pduALoadPct)} · B {pduText(r.pduBOnline, r.pduBLoadPct)}
-          {oneFeed && <b> · no backup</b>}
-        </div>
-        <div className="metrics">
-          {SENSOR_KEYS.filter(k => k !== fk).map(k => {
-            const km = kindOf(k);
-            const bad = (km.read?.(r) ?? 0) >= km.warn;
-            return <span key={k} className={bad ? 'red-text' : ''} title={km.label}>{km.label}: {fmt(k, r)}</span>;
-          })}
-        </div>
-        <div className="row between muted xs">
-          <span>Aisle {r.aisle}{r.fault ? <span className="red-text"> · {r.fault} fault</span> : null}</span>
-          <select className="fault-pick" value="" disabled={!connected || down} onChange={e => e.target.value && breakRack({ rackId: r.id, fault: e.target.value })}>
-            <option value="">simulate fault ▾</option>
+        <div className="spark"><Sparkline values={historyFor(r.id, fk)} h={big ? 44 : 34} /></div>
+        {big && (
+          <>
+            <div className={`pdu-row ${oneFeed || down ? 'red-text' : ''}`} title="Power Distribution Units: each server is plugged into both A and B">
+              PDU A {pduText(r.pduAOnline, r.pduALoadPct)} · B {pduText(r.pduBOnline, r.pduBLoadPct)}
+              {oneFeed && <b> · no backup</b>}
+            </div>
+            <div className="metrics">
+              {SENSOR_KEYS.filter(k => k !== fk).map(k => {
+                const km = kindOf(k);
+                const bad = (km.read?.(r) ?? 0) >= km.warn;
+                return <span key={k} className={bad ? 'red-text' : ''} title={km.label}>{km.label}: {fmt(k, r)}</span>;
+              })}
+            </div>
+          </>
+        )}
+        <div className="tile-foot">
+          {alerts.length && !big
+            ? <span className="red-text">{alerts[0]}</span>
+            : <span className="muted">{big ? m.label : tenant ? tenant.name.split(' ')[0] : `Aisle ${r.aisle}`}</span>}
+          <select className="fault-pick" value="" disabled={!connected || down} onChange={e => e.target.value && breakRack({ rackId: r.id, fault: e.target.value })} title="Simulate a fault (demo)">
+            <option value="">break ▾</option>
             {RACK_FAULTS.filter(x => x.id !== r.fault).map(x => <option key={x.id} value={x.id}>{x.label}</option>)}
           </select>
         </div>
@@ -244,28 +321,72 @@ export default function App() {
     );
   };
 
-  const cduCard = (c: (typeof sortedCdus)[number]) => {
+  const cduCard = (c: (typeof sortedCdus)[number], big?: boolean) => {
     const served = sortedRacks.filter(r => r.aisle === c.aisle).map(r => r.id).join(', ');
+    const bad = c.status !== 'ok';
     return (
-      <div key={c.id} className={`rack cdu ${tone[c.status]}`}>
-        <div className="row between"><b>{c.id}</b><Chip v={c.status} /></div>
+      <div key={c.id} className={`rack cdu ${tone[c.status]} ${big ? 'big' : ''}`}>
+        <div className="row between"><b>{c.id}</b>{c.status === 'ok' ? <span className="dot ok" /> : <Chip v={c.status} />}</div>
         <div className="rack-temp">{c.flowLpm.toFixed(0)}<span> L/min</span></div>
-        <div className="muted xxs">Coolant flow (normal ~120)</div>
-        <div className="spark"><Sparkline values={cduHistory(c.id)} h={30} /></div>
-        <div className="metrics">
-          <span className={c.pressureKpa < 160 ? 'red-text' : ''}>Pressure {c.pressureKpa.toFixed(0)} kPa</span>
-          <span className={c.supplyTempC > 30 ? 'red-text' : ''}>Coolant {c.supplyTempC.toFixed(1)}°C</span>
-        </div>
-        <div className="row between muted xs">
-          <span>Cools {served}{c.fault ? <span className="red-text"> · {c.fault} fault</span> : null}</span>
+        <div className="spark"><Sparkline values={cduHistory(c.id)} h={big ? 44 : 34} /></div>
+        {big && (
+          <div className="metrics">
+            <span className={c.pressureKpa < 160 ? 'red-text' : ''}>Pressure {c.pressureKpa.toFixed(0)} kPa</span>
+            <span className={c.supplyTempC > 30 ? 'red-text' : ''}>Coolant {c.supplyTempC.toFixed(1)}°C</span>
+          </div>
+        )}
+        <div className="tile-foot">
+          {bad && !big
+            ? <span className="red-text">{c.pressureKpa.toFixed(0)} kPa · cools {served}</span>
+            : <span className="muted">Coolant flow · cools {served}</span>}
           {!c.fault && (
-            <select className="fault-pick" value="" disabled={!connected} onChange={e => e.target.value && breakCdu({ cduId: c.id, fault: e.target.value })}>
-              <option value="">simulate fault ▾</option>
+            <select className="fault-pick" value="" disabled={!connected} onChange={e => e.target.value && breakCdu({ cduId: c.id, fault: e.target.value })} title="Simulate a fault (demo)">
+              <option value="">break ▾</option>
               <option value="pump">Pump failure</option>
-              <option value="leak">Coolant leak</option>
             </select>
           )}
         </div>
+      </div>
+    );
+  };
+
+  const comparePanel = () => {
+    const ex = experiments.find(e => e.id === 'main');
+    const dur = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`);
+    const side = (warningId: bigint | undefined, cdu: string, label: string, paged: boolean) => {
+      const w = warningId ? warnings.find(x => x.id === warningId) : undefined;
+      const inc = w ? incidentOf(w.id) : undefined;
+      if (!w) return <div className="cmp-side"><div className="muted xxs">{label}</div><div className="cmp-big">—</div><div className="muted xs">Waiting for {cdu} to alarm…</div></div>;
+      const end = w.claimedAt ? toDate(w.claimedAt).getTime() : Date.now();
+      const secs = Math.max(0, Math.round((end - toDate(w.createdAt).getTime()) / 1000));
+      const cost = (inc?.costPerMinute ?? 0) * (secs / 60);
+      const missed = pagesOf(w.id).filter(p => p.status === 'missed' || p.status === 'declined').length;
+      return (
+        <div className={`cmp-side ${w.claimedAt ? 'done' : 'running'}`}>
+          <div className="muted xxs">{label} · {cdu}</div>
+          <div className="cmp-big">{dur(secs)}{!w.claimedAt && <span className="muted xxs"> and counting</span>}</div>
+          <div className="xs">{w.claimedAt ? `Owned by ${nameOf(w.claimedBy)}` : paged ? routingLine(w.id) || 'Paging…' : 'Nobody has been told'}{paged && missed ? ` · ${missed} page${missed > 1 ? 's' : ''} unanswered` : ''}</div>
+          <div className="muted xxs">≈ ${Math.round(cost).toLocaleString()} of exposure while unowned (assumed rates)</div>
+        </div>
+      );
+    };
+    if (!ex?.active)
+      return (
+        <div className="panel cmp idle">
+          <div className="row between wrap">
+            <div><h3 style={{ margin: 0 }}>Compare: old way vs Night Watch</h3><div className="muted xs">Breaks two CDUs at once. CDU-A is handled the old way (the alert just sits on the dashboard). CDU-C gets Night Watch paging and escalation.</div></div>
+            <button className="ghost sm" disabled={!connected} onClick={() => startComparison()}>Run comparison</button>
+          </div>
+        </div>
+      );
+    return (
+      <div className="panel cmp">
+        <div className="panel-head"><h3>Time to owned: old way vs Night Watch</h3><button className="link" onClick={() => stopComparison()}>End comparison</button></div>
+        <div className="cmp-grid">
+          {side(ex.baselineWarningId || undefined, ex.baselineCdu, 'Old way (no paging)', false)}
+          {side(ex.pagedWarningId || undefined, ex.pagedCdu, 'With Night Watch', true)}
+        </div>
+        <div className="muted xxs" style={{ marginTop: 8 }}>Demo comparison on simulated faults, not a field measurement. Act as the paged tech (bottom left) to acknowledge CDU-C.</div>
       </div>
     );
   };
@@ -274,99 +395,209 @@ export default function App() {
   const Overview = () => {
     const crit = racks.filter(r => r.status === 'critical' || r.status === 'down').length;
     const warn = racks.filter(r => r.status === 'warning').length;
-    const racksOnline = racks.filter(r => r.status !== 'down').length;
     const redundant = racks.filter(r => r.pduAOnline && r.pduBOnline).length;
     const cdusOk = cdus.filter(c => c.status === 'ok').length;
-    const lastIncident = allWarnings[0];
-    // Unclaimed critical first, then by severity, then oldest first.
     const sevRank: Record<string, number> = { critical: 0, medium: 1, low: 2 };
+    // Priority = severity after the customer-sensitivity bump (or a supervisor override).
+    const prio = (w: (typeof active)[number]) => incidentOf(w.id)?.priority ?? w.severity;
     const queue = [...active].sort((a, b) => {
-      const ua = a.status === 'open' && a.severity === 'critical' ? 0 : 1;
-      const ub = b.status === 'open' && b.severity === 'critical' ? 0 : 1;
+      const ua = a.status === 'open' && prio(a) === 'critical' ? 0 : 1;
+      const ub = b.status === 'open' && prio(b) === 'critical' ? 0 : 1;
       if (ua !== ub) return ua - ub;
-      const sr = (sevRank[a.severity] ?? 3) - (sevRank[b.severity] ?? 3);
+      const sr = (sevRank[prio(a)] ?? 3) - (sevRank[prio(b)] ?? 3);
       if (sr) return sr;
       if ((a.status === 'open') !== (b.status === 'open')) return a.status === 'open' ? -1 : 1;
       return a.id < b.id ? -1 : 1;
     });
+
+    // ── The one thing to look at: the worst root-cause incident, and what it is costing ──
+    const top = queue.find(w => incidentOf(w.id)?.mode !== 'symptom');
+    const topInc = top ? incidentOf(top.id) : undefined;
+    const topPage = top ? pagesOf(top.id).find(p => p.status === 'paging' || p.status === 'queued') : undefined;
+    const topEta = topInc?.minutesToCritical ?? -1;
+    const etaTxt = topEta === 0 ? 'now' : topEta > 0 ? (topEta < 1 ? `${Math.max(5, Math.round((topEta * 60) / 5) * 5)}s` : `${Math.round(topEta)} min`) : '';
+    const burn = active.reduce((sum, w) => sum + (incidentOf(w.id)?.mode === 'symptom' ? 0 : incidentOf(w.id)?.costPerMinute ?? 0), 0);
+    const pagedMe = !!(me && top && pages.some(p => p.techId === me.id && p.warningId === top.id && p.status === 'paging'));
+    const heroTone = crit || queue.some(w => prio(w) === 'critical') ? 'bad' : active.length ? 'warn' : 'ok';
+    const whoLine = !top ? '' :
+      top.claimedBy !== undefined ? `${nameOf(top.claimedBy)} is on it`
+      : topInc?.mode === 'auto' ? 'Nemotron agent is fixing it · nobody paged'
+      : topPage?.status === 'paging' ? `Paging ${nameOf(topPage.techId)} · escalates in ${secsLeft(topPage)}s`
+      : topPage ? `Holding for ${nameOf(topPage.techId)} next shift`
+      : 'Nobody has it yet';
+    const others = queue.length - 1;
+    const caughtEarly = allWarnings.filter(w => w.source === 'agent').length;
+    const agentFixes = [...records].filter(r => r.kind === 'agent_action').length;
+    const ownedTimes = allWarnings.filter(w => w.claimedAt).map(w => Math.round((toDate(w.claimedAt!).getTime() - toDate(w.createdAt).getTime()) / 1000));
+    const ownedAvg = ownedTimes.length ? Math.round(ownedTimes.reduce((x, y) => x + y, 0) / ownedTimes.length) : 0;
+
     return (
       <>
-        <div className="page-head row between wrap"><div><h1>Overview</h1><p className="muted">Live floor status · updates every 3 seconds</p></div><button className="primary" onClick={() => setShowReport(true)}>+ Report issue</button></div>
-        {reportForm()}
-        <div className="stats">
-          <Stat label="Racks healthy" value={`${racks.length - crit - warn}/${racks.length}`} t="green" />
-          <Stat label="Open warnings" value={active.length} sub={`${unclaimed.length} unclaimed`} t={unclaimed.length ? 'red' : ''} />
-          <Stat label="Pending handoffs" value={pendingHandoffs.length} t={pendingHandoffs.length ? 'amber' : ''} />
-          <Stat label="Signed records" value={records.length} sub={`${records.filter(r => r.txSignature).length} on-chain`} />
+        <div className="page-head row between wrap">
+          <div><h1>Night Watch</h1><p className="muted">Data center floor · live, updates every 3 seconds</p></div>
+          <button className="primary" onClick={() => setShowReport(true)}>+ Report issue</button>
         </div>
+        {reportForm()}
+
+        <div className={`hero ${heroTone}`}>
+          {top ? (
+            <>
+              <div className="hero-main">
+                <div className="hero-eyebrow">{crit > 0 ? `${crit} rack${crit > 1 ? 's' : ''} critical` : 'Needs attention'}{others > 0 ? ` · ${others} more open` : ''}</div>
+                <div className="hero-title">{top.rackId} · {kindOf(top.kind).title}</div>
+                <div className="hero-sub">{whoLine}{etaTxt ? ` · critical in ${etaTxt}` : ''}{topInc?.tenants ? ` · ${topInc.tenants.split(', ')[0]}${topInc.tenants.includes(',') ? ` +${topInc.tenants.split(', ').length - 1} more` : ''} exposed` : ''}</div>
+              </div>
+              {burn > 0 && (
+                <div className="hero-burn">
+                  <div className="hero-burn-v">${Math.round(burn * 10).toLocaleString()}</div>
+                  <div className="hero-burn-l">at risk per 10 min</div>
+                </div>
+              )}
+              <div className="hero-act">
+                {top.status === 'open' && topInc?.mode !== 'auto' && (
+                  <button className="primary" disabled={busy} onClick={() => me && claimWarning({ warningId: top.id, techId: me.id })}>
+                    {pagedMe ? 'Acknowledge' : `Claim as ${me?.name.split(' ')[0]}`}
+                  </button>
+                )}
+                <button className="ghost" onClick={() => openWarning(top.id)}>Open incident</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="hero-main">
+                <div className="hero-eyebrow">All clear</div>
+                <div className="hero-title">{racks.length} racks and {cdus.length} cooling units normal</div>
+                <div className="hero-sub">Nemotron is watching every sensor. Break something below to see what happens.</div>
+              </div>
+              <div className="hero-act"><button className="ghost" onClick={() => setView('record')}>{records.length} signed records</button></div>
+            </>
+          )}
+        </div>
+
+        <div className="kpis">
+          <div className="kpi violet">
+            <div className="kpi-l">Caught early by Nemotron</div>
+            <div className="kpi-v">{caughtEarly}</div>
+            <div className="kpi-s">before they hit a limit</div>
+          </div>
+          <div className="kpi green">
+            <div className="kpi-l">Fixed by the agent</div>
+            <div className="kpi-v">{agentFixes}</div>
+            <div className="kpi-s">no technician needed</div>
+          </div>
+          <div className="kpi amber">
+            <div className="kpi-l">Time to owned</div>
+            <div className="kpi-v">{ownedAvg ? `${ownedAvg}s` : '—'}</div>
+            <div className="kpi-s">{ownedAvg ? 'average, alert to owner' : 'nothing owned yet'}</div>
+          </div>
+          <div className="kpi cyan">
+            <div className="kpi-l">Signed on Solana</div>
+            <div className="kpi-v">{records.filter(r => r.txSignature).length}</div>
+            <div className="kpi-s">{records.filter(r => !r.txSignature).length} waiting to write</div>
+          </div>
+        </div>
+
+        {queue.length > 0 && (
+          <div className="panel queue">
+            <div className="panel-head">
+              <h3>Open issues <span className="count">{queue.length}</span></h3>
+              <button className="link" onClick={() => setView('warnings')}>View all</button>
+            </div>
+            {queue.filter(w => incidentOf(w.id)?.mode !== 'symptom').map(w => {
+              const i0 = incidentOf(w.id);
+              // Racks heating because this CDU failed: one quiet line, not a row each.
+              const kids = w.kind === 'cdu' ? queue.filter(x => incidentOf(x.id)?.mode === 'symptom' && incidentOf(x.id)?.decision.includes(w.rackId)) : [];
+              return (
+                <div key={`g${w.id}`}>
+                  <div className={`q-row sev-${prio(w)}`} onClick={() => openWarning(w.id)}>
+                    <div className="q-main">
+                      <div className="q-title">
+                        <b>{w.rackId}</b>
+                        <span>{kindOf(w.kind).title}</span>
+                        {w.source === 'agent' && <span className="q-tag">AI</span>}
+                      </div>
+                      <div className="q-meta">
+                        <span className={`sev-text-${prio(w)}`}>{prio(w)}</span>
+                        <span>{ago(w.createdAt)}</span>
+                        <span>{w.claimedBy !== undefined ? nameOf(w.claimedBy) : routingLine(w.id) || 'Unassigned'}</span>
+                        {w.status === 'fixing' && <span>Verifying fix</span>}
+                      </div>
+                    </div>
+                    {w.status === 'open' && i0?.mode === 'auto' && <span className="ai-tag">Agent fixing it</span>}
+                    {w.status === 'open' && i0?.mode !== 'auto' && (
+                      <button className="q-claim" disabled={busy} onClick={e => { e.stopPropagation(); if (me) claimWarning({ warningId: w.id, techId: me.id }); }}>
+                        Claim
+                      </button>
+                    )}
+                  </div>
+                  {kids.length > 0 && (
+                    <div className="q-kids" onClick={() => openWarning(kids[0].id)}>
+                      <span className="q-kids-br" />
+                      {kids.length} rack{kids.length > 1 ? 's' : ''} heating because of this ({kids.map(k => k.rackId).join(', ')}) · no separate page, clears when {w.rackId} is fixed
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         <div className="two">
           <div className="panel">
-            <div className="panel-head"><h3>Racks</h3><button className="link" onClick={() => setView('racks')}>View all</button></div>
-            <div className="rack-grid">{sortedRacks.map(r => rackCard(r))}</div>
-            <div className="panel-head" style={{ marginTop: 16 }}><h3>Liquid cooling (CDUs)</h3><span className="muted xxs">Each CDU pumps coolant to every rack in its aisle</span></div>
-            <div className="rack-grid">{sortedCdus.map(c => cduCard(c))}</div>
+            <div className="panel-head">
+              <h3>Floor map</h3>
+              <div className="row heat-key">
+                <span className="muted xxs">68°F</span>
+                <span className="heat-bar" />
+                <span className="muted xxs">95°F</span>
+                <button className="link" onClick={() => setView('racks')}>Rack detail</button>
+              </div>
+            </div>
+            {['A', 'B', 'C'].map(aisle => {
+              const c = cdus.find(x => x.aisle === aisle);
+              const rs = sortedRacks.filter(r => r.aisle === aisle);
+              return (
+                <div key={aisle} className="aisle">
+                  <div className="aisle-l">Aisle {aisle}</div>
+                  <div className={`cdu-chip ${c && c.status !== 'ok' ? 'bad' : ''}`} title={c ? `${c.id}: ${c.flowLpm.toFixed(0)} L/min (normal ~120)` : ''}>
+                    <span className="cdu-chip-n">{c?.flowLpm.toFixed(0) ?? '—'}</span>
+                    <span className="cdu-chip-l">{c?.id ?? ''}</span>
+                  </div>
+                  <div className="aisle-racks">
+                    {rs.map(r => {
+                      const t0 = r.temperatureF;
+                      const pct = Math.max(0, Math.min(1, (t0 - 68) / 27));
+                      // Calm slate while normal, then it warms up and goes vivid red as it nears the limit.
+                      const bg = r.status === 'down' ? 'hsl(0 70% 32%)' : `hsl(${Math.round(210 - pct * 210)} ${Math.round(12 + pct * pct * 78)}% ${Math.round(17 + pct * pct * 26)}%)`;
+                      const tn = tenantOf(r.id);
+                      return (
+                        <div key={r.id} className={`heat ${r.status} ${r.pduAOnline && r.pduBOnline ? '' : 'nopower'}`} style={{ background: bg }} onClick={() => setView('racks')} title={`${r.id} · ${tn?.name ?? ''} · ${t0.toFixed(1)}°F`}>
+                          <div className="heat-id">{r.id}</div>
+                          <div className="heat-t">{r.status === 'down' ? 'OFF' : `${t0.toFixed(0)}°`}</div>
+                          <div className="heat-tn">{r.pduAOnline && r.pduBOnline ? tn?.name.split(' ')[0] ?? '' : 'PDU down'}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+            <div className="row between floor-sum">
+              <span className={crit ? 'red-text' : 'ok-text'}>{racks.length - crit - warn}/{racks.length} racks healthy</span>
+              <span className={redundant < racks.length ? 'warn-text' : 'ok-text'}>{redundant}/{racks.length} on dual power</span>
+              <span className={cdusOk < cdus.length ? 'red-text' : 'ok-text'}>{cdusOk}/{cdus.length} cooling units normal</span>
+            </div>
           </div>
           <div className="side-col">
             <div className="panel">
-              <div className="panel-head"><h3>Floor status</h3></div>
-              <div className="status-grid">
-                <div className={`status-cell ${racksOnline < racks.length ? 'bad' : ''}`}>
-                  <div className="status-num">{racksOnline}/{racks.length}</div>
-                  <div className="status-lbl">Racks online</div>
-                </div>
-                <div className={`status-cell ${redundant < racks.length ? 'warn' : ''}`}>
-                  <div className="status-num">{redundant}/{racks.length}</div>
-                  <div className="status-lbl">Dual PDU feeds</div>
-                </div>
-                <div className={`status-cell ${cdusOk < cdus.length ? 'bad' : ''}`}>
-                  <div className="status-num">{cdusOk}/{cdus.length}</div>
-                  <div className="status-lbl">CDUs healthy</div>
-                </div>
-                <div className="status-cell">
-                  <div className="status-num">{lastIncident ? ago(lastIncident.createdAt).replace(' ago', '') : '—'}</div>
-                  <div className="status-lbl">Since last incident</div>
-                </div>
-              </div>
-            </div>
-
-            <div className="panel queue">
-              <div className="panel-head">
-                <h3>Open issues <span className="count">{active.length}</span></h3>
-                {active.length > 0 && <button className="link" onClick={() => setView('warnings')}>View all</button>}
-              </div>
-              {queue.map(w => (
-                <div key={w.id.toString()} className={`q-row sev-${w.severity}`} onClick={() => openWarning(w.id)}>
-                  <div className="q-main">
-                    <div className="q-title">
-                      <b>{w.rackId}</b>
-                      <span>{kindOf(w.kind).title}</span>
-                      {w.source === 'agent' && <span className="q-tag">AI</span>}
-                    </div>
-                    <div className="q-msg">{w.message}</div>
-                    <div className="q-meta">
-                      <span className={`sev-text-${w.severity}`}>{w.severity}</span>
-                      <span>{ago(w.createdAt)}</span>
-                      <span>{w.claimedBy !== undefined ? nameOf(w.claimedBy) : 'Unassigned'}</span>
-                      {w.status === 'fixing' && <span>Verifying fix</span>}
-                    </div>
-                  </div>
-                  {w.status === 'open' && (
-                    <button className="q-claim" disabled={busy} onClick={e => { e.stopPropagation(); if (me) claimWarning({ warningId: w.id, techId: me.id }); }}>
-                      Claim
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-
-            <div className="panel">
-              <div className="panel-head"><h3>Activity log</h3><button className="link" onClick={() => setView('record')}>Full record</button></div>
+              <div className="panel-head"><h3>Activity</h3><button className="link" onClick={() => setView('record')}>Full record</button></div>
               <div className="log">
-                {sortedRecords.slice(0, 6).map(rec => (
+                {sortedRecords.length === 0 && <p className="empty">Nothing signed yet.</p>}
+                {sortedRecords.slice(0, 10).map(rec => (
                   <div key={rec.id.toString()} className="log-row">
                     <span className="log-time">{clock(rec.createdAt).replace(/:\d\d (?=[AP]M)/, ' ')}</span>
                     <span className="log-text">
-                      <span className="log-kind">{rec.kind === 'fix_verified' ? 'Verified' : rec.kind === 'claim' ? 'Claimed' : 'Handoff'}</span>
+                      <span className={`log-kind k-${rec.kind}`}>{REC_LABEL[rec.kind] ?? rec.kind}</span>
                       {rec.summary}
                     </span>
                     <span className={`log-chain ${rec.txSignature ? 'on' : ''}`} title={rec.txSignature ? 'Written to Solana devnet' : 'Waiting to be written on-chain'}>
@@ -376,37 +607,182 @@ export default function App() {
                 ))}
               </div>
             </div>
+            {comparePanel()}
           </div>
         </div>
       </>
     );
   };
 
+  // ─── verify an incident's timeline against Solana ───
+  const [verify, setVerify] = useState<Record<string, { running: boolean; checks: Check[] }>>({});
+  const verifyTimeline = async (warningId: bigint) => {
+    const key = warningId.toString();
+    setVerify(s => ({ ...s, [key]: { running: true, checks: [] } }));
+    const recs = [...records].filter(r => r.refId === warningId && r.kind !== 'handoff' && r.txSignature).sort((a, b) => (a.id < b.id ? -1 : 1));
+    const checks: Check[] = [];
+    let prevLocal = '';
+    for (const r of recs) {
+      const local = await fingerprint(r);
+      const link = links.find(l => l.recordId === r.id);
+      try {
+        const memo = await memoOf(r.txSignature);
+        if (!memo) checks.push({ recordId: r.id.toString(), ok: false, note: 'transaction not found' });
+        else if (memo.sha256 !== local) checks.push({ recordId: r.id.toString(), ok: false, note: 'record was changed after it was signed' });
+        else if (link && (memo.prev ?? '') !== prevLocal) checks.push({ recordId: r.id.toString(), ok: false, note: 'an earlier event is missing or was changed' });
+        else checks.push({ recordId: r.id.toString(), ok: true, note: link ? 'linked' : 'matches (older record, no link)' });
+      } catch {
+        checks.push({ recordId: r.id.toString(), ok: false, note: 'could not reach Solana' });
+      }
+      if (link) prevLocal = local;
+      await new Promise(res => setTimeout(res, 250)); // be gentle with the free devnet server
+    }
+    setVerify(s => ({ ...s, [key]: { running: false, checks } }));
+  };
+  // A shared link (?incident=ID) opens that incident.
+  useEffect(() => {
+    const id = new URLSearchParams(location.search).get('incident');
+    if (id) { setSelectedId(BigInt(id)); setView('warnings'); }
+  }, []);
+
+  // ─── incident log: everything that happened, in order ───
+  const incidentLog = (w: (typeof allWarnings)[number]) => {
+    const ms = (ts?: Micros) => (ts ? toDate(ts).getTime() : 0);
+    const chain = pagesOf(w.id);
+    const an = analysisOf(w.id);
+    const ev: { t: number; who: string; text: string; tone: string; tx?: string }[] = [];
+    const src = w.source === 'agent' ? 'Nemotron agent' : w.source === 'tech' ? nameOf(w.reportedBy) : 'Sensor rule';
+    ev.push({ t: ms(w.createdAt), who: src, text: `raised the alert: ${w.message}`, tone: 'red' });
+    // Signed records for this incident, matched to page events in order (k-th "paged" record = k-th page sent).
+    const recsOf = (kind: string) => [...records].filter(r => r.refId === w.id && r.kind === kind).sort((a, b) => (a.id < b.id ? -1 : 1));
+    const pagedRecs = recsOf('paged'), missedRecs = recsOf('page_missed'), declinedRecs = recsOf('page_declined'), heldRecs = recsOf('page_held');
+    let np = 0, nm = 0, nd = 0, nh = 0;
+    // Include superseded holds too, so the log shows the full story.
+    const allPages = [...pages].filter(p => p.warningId === w.id).sort((a, b) => (a.id < b.id ? -1 : 1));
+    allPages.forEach(p => {
+      const sent = allPages.filter(o => o.timeoutSec > 0);
+      const next = sent[sent.indexOf(p) + 1];
+      if (p.timeoutSec === 0) {
+        ev.push({ t: ms(p.pagedAt), who: 'Night Watch', text: `held it for ${nameOf(p.techId)} instead of paging now (${p.reason})`, tone: 'blue', tx: heldRecs[nh++]?.txSignature });
+        return;
+      }
+      ev.push({ t: ms(p.pagedAt), who: 'Night Watch', text: `paged ${nameOf(p.techId)} (${p.reason}), ${p.timeoutSec}s to respond`, tone: 'amber', tx: pagedRecs[np++]?.txSignature });
+      const end = next ? ms(next.pagedAt) : ms(p.pagedAt) + p.timeoutSec * 1000;
+      if (p.status === 'missed') ev.push({ t: end - 1, who: nameOf(p.techId), text: `didn't respond in ${p.timeoutSec}s, so it escalated`, tone: 'red', tx: missedRecs[nm++]?.txSignature });
+      if (p.status === 'declined') ev.push({ t: end - 1, who: nameOf(p.techId), text: `said they can't take it, so it escalated`, tone: 'red', tx: declinedRecs[nd++]?.txSignature });
+      if (p.status === 'acknowledged' && p.ackAt) ev.push({ t: ms(p.ackAt), who: nameOf(p.techId), text: `acknowledged the page`, tone: 'green' });
+    });
+    if (an) ev.push({ t: ms(an.createdAt), who: 'Nemotron', text: `root cause (${an.confidence}% confident): ${an.rootCause}. ${an.runbook}`, tone: 'blue' });
+    if (w.claimedAt && !chain.some(p => p.status === 'acknowledged' && p.techId === w.claimedBy))
+      ev.push({ t: ms(w.claimedAt), who: nameOf(w.claimedBy), text: `claimed it from the dashboard`, tone: 'green' });
+    const recs = [...records].filter(r => r.refId === w.id && (r.kind === 'claim' || r.kind === 'fix_verified'));
+    for (const r of [...records].filter(r0 => r0.refId === w.id && r0.kind === 'agent_action'))
+      ev.push({ t: ms(r.createdAt), who: 'Nemotron agent', text: r.summary.replace(/^Nemotron agent /, ''), tone: 'blue', tx: r.txSignature });
+    for (const r of recs) ev.push({ t: ms(r.createdAt) + (r.kind === 'claim' ? 1 : 0), who: r.kind === 'claim' ? 'Signed record' : 'Sensor data', text: r.kind === 'claim' ? `ownership signed: ${r.summary}` : r.summary, tone: r.kind === 'claim' ? 'gray' : 'green', tx: r.txSignature });
+    if (w.status === 'resolved' && !recs.some(r => r.kind === 'fix_verified')) ev.push({ t: ms(w.resolvedAt), who: 'Night Watch', text: 'marked resolved', tone: 'green' });
+    ev.sort((a, b) => a.t - b.t);
+    const total = w.resolvedAt ? Math.round((ms(w.resolvedAt) - ms(w.createdAt)) / 1000) : undefined;
+    const ackSecs = w.claimedAt ? Math.round((ms(w.claimedAt) - ms(w.createdAt)) / 1000) : undefined;
+    const dur = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`);
+    const key = w.id.toString();
+    const v = verify[key];
+    const onChain = [...records].filter(r => r.refId === w.id && r.kind !== 'handoff' && r.txSignature).length;
+    return (
+      <div className="panel">
+        <div className="panel-head">
+          <h3>Incident log</h3>
+          <div className="row">
+            <span className="muted xxs">{ackSecs !== undefined ? `owned after ${dur(ackSecs)}` : 'not owned yet'}{total !== undefined ? ` · resolved in ${dur(total)}` : ''}</span>
+            {onChain > 0 && <button className="ghost sm" disabled={v?.running} onClick={() => void verifyTimeline(w.id)}>{v?.running ? 'Checking Solana…' : 'Verify timeline'}</button>}
+            {onChain > 0 && <button className="ghost sm" onClick={() => void navigator.clipboard?.writeText(`${location.origin}${location.pathname}?incident=${key}`)} title="Link that opens this incident's verifiable timeline">Copy link</button>}
+          </div>
+        </div>
+        {v && !v.running && (
+          <div className={`callout ${v.checks.every(c => c.ok) ? 'green' : 'red'} xs`}>
+            {v.checks.every(c => c.ok)
+              ? `✓ Timeline intact: ${v.checks.length} record${v.checks.length > 1 ? 's' : ''} match Solana devnet, each linked to the one before it. Nothing was deleted or changed.`
+              : `✗ ${v.checks.filter(c => !c.ok).length} record(s) don't match Solana: ${v.checks.filter(c => !c.ok).map(c => `#${c.recordId} ${c.note}`).join('; ')}`}
+          </div>
+        )}
+        <div className="ilog">
+          {ev.map((e, i) => (
+            <div key={i} className="ilog-row">
+              <span className="log-time">{e.t ? new Date(e.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''}</span>
+              <span className={`ilog-dot ${e.tone}`} />
+              <span className="xs"><b>{e.who}</b> {e.text}
+                {e.tx !== undefined && (e.tx
+                  ? <> · <a className="chain-link" href={`https://explorer.solana.com/tx/${e.tx}?cluster=devnet`} target="_blank" rel="noreferrer">on-chain ↗</a></>
+                  : <span className="muted"> · on-chain pending</span>)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  // ─── incident page: summary strip, one action, then tabs ───
+  const [incTab, setIncTab] = useState<'overview' | 'impact' | 'routing' | 'log'>('overview');
+
   const Warnings = () => {
-    const steps = selected ? [...tasks].filter(t0 => t0.warningId === selected.id).sort((a, b) => a.stepNumber - b.stepNumber) : [];
-    const rack = selected ? racks.find(r => r.id === selected.rackId) : undefined;
-    const mine = selected && me && selected.claimedBy === me.id;
-    const reported = selected?.kind === 'reported';
-    const km = selected ? kindOf(selected.kind) : undefined;
-    const life = selected && km ? [
-      { label: reported ? 'Issue reported' : 'Warning raised', detail: `${selected.source === 'agent' ? 'Nemotron agent' : selected.source === 'tech' ? nameOf(selected.reportedBy) : 'Sensor rule'} · ${clock(selected.createdAt)}`, done: true },
-      { label: 'Claimed & signed', detail: selected.claimedAt ? `${nameOf(selected.claimedBy)} · ${clock(selected.claimedAt)}` : 'Waiting for an owner', done: !!selected.claimedAt, current: selected.status === 'open' },
-      { label: 'Fix submitted', detail: selected.status === 'fixing' || selected.status === 'resolved' ? 'Tech marked the fix done' : 'Not yet', done: selected.status === 'fixing' || selected.status === 'resolved', current: selected.status === 'claimed' },
-      reported
-        ? { label: 'Verified by a second tech', detail: selected.resolvedAt ? `${nameOf(selected.verifiedBy)} · ${clock(selected.resolvedAt)}` : 'Someone other than the fixer must confirm', done: selected.status === 'resolved', current: selected.status === 'fixing' }
-        : {
-            label: 'Verified by data',
-            detail: selected.resolvedAt
-              ? `${km.label} back to normal · ${clock(selected.resolvedAt)}`
-              : selected.kind === 'cdu'
-                ? 'Waits for flow above 105 L/min and pressure above 190 kPa'
-                : selected.kind === 'pdu'
-                  ? 'Waits for both PDU feeds back online and load under 70%'
-                  : `Waits for ${km.label.toLowerCase()} under ${km.ok}${km.unit}`,
-            done: selected.status === 'resolved',
-            current: selected.status === 'fixing',
-          },
-    ] : [];
+    const w = selected;
+    const steps = w ? [...tasks].filter(t0 => t0.warningId === w.id).sort((a, b) => a.stepNumber - b.stepNumber) : [];
+    const rack = w ? racks.find(r => r.id === w.rackId) : undefined;
+    const mine = !!(w && me && w.claimedBy === me.id);
+    const reported = w?.kind === 'reported';
+    const km = w ? kindOf(w.kind) : undefined;
+    const inc = w ? incidentOf(w.id) : undefined;
+    const an = w ? analysisOf(w.id) : undefined;
+    const chain = w ? pagesOf(w.id) : [];
+    const live = chain.find(p => p.status === 'paging' || p.status === 'queued');
+    const myPage = !!(me && live && live.status === 'paging' && live.techId === me.id);
+    const prio = inc?.priority ?? w?.severity ?? 'medium';
+    const eta = inc?.minutesToCritical ?? -1;
+    const done = w?.status === 'resolved';
+    const agentFixed = !!w && w.kind === 'power' && w.claimedBy === undefined && (w.status === 'fixing' || w.status === 'resolved');
+    const agentWorking = !!w && w.kind === 'power' && w.status === 'open' && inc?.mode === 'auto';
+    const tenantRows = (inc?.tenants ?? '').split(', ').filter(Boolean).map(n => {
+      const tn = tenants.find(x => x.name === n);
+      return { name: n, tn, sig: tn ? signals.find(sg => sg.tenantId === tn.id) : undefined };
+    });
+    const verifyRule = !w || !km ? '' : reported ? 'A second tech must confirm the fix'
+      : w.kind === 'cdu' ? 'Clears when flow is above 105 L/min and pressure above 190 kPa'
+      : w.kind === 'pdu' ? 'Clears when both PDU feeds are back online'
+      : `Clears when ${km.label.toLowerCase()} is under ${km.ok}${km.unit}`;
+    const reading = !w ? '' : w.kind === 'cdu'
+      ? (() => { const c = cdus.find(x => x.id === w.rackId); return c ? `${c.flowLpm.toFixed(0)} L/min · ${c.pressureKpa.toFixed(0)} kPa` : ''; })()
+      : w.kind === 'pdu' ? (rack ? `PDU A ${pduText(rack.pduAOnline, rack.pduALoadPct)} · B ${pduText(rack.pduBOnline, rack.pduBLoadPct)}` : '')
+      : reported ? '' : fmt(w.kind, rack);
+    const etaTxt = eta === 0 ? 'Now' : eta > 0 ? (eta < 1 ? `${Math.max(5, Math.round((eta * 60) / 5) * 5)} s` : `${Math.round(eta)} min`) : 'No deadline';
+
+    const action = () => {
+      if (!w) return null;
+      if (agentFixed) return <span className="green-text xs">{w.status === 'resolved' ? '✓ Fixed by the Nemotron agent and verified by sensors. Nobody was paged.' : 'The Nemotron agent fixed this itself. Waiting for the sensors to confirm…'}</span>;
+      if (agentWorking) return <span className="muted xs">The Nemotron agent is fixing this itself. A tech is paged only if that doesn't work.</span>;
+      if (w.status === 'open') return (
+        <>
+          <button className="primary" disabled={busy} onClick={() => me && claimWarning({ warningId: w.id, techId: me.id })}>{myPage ? 'Acknowledge page' : `Claim as ${me?.name.split(' ')[0]}`}</button>
+          {myPage && <button className="ghost" disabled={busy} onClick={() => me && declinePage({ warningId: w.id, techId: me.id })}>Can't take it</button>}
+        </>
+      );
+      if (w.status === 'claimed') return mine
+        ? <button className="primary" disabled={busy} onClick={() => me && markFixed({ warningId: w.id, techId: me.id })}>Mark fix done</button>
+        : <span className="muted xs">{nameOf(w.claimedBy)} owns this. Only they can mark it fixed.</span>;
+      if (w.status === 'fixing') return reported
+        ? (me && w.claimedBy !== me.id
+          ? <button className="primary" disabled={busy} onClick={() => verifyFix({ warningId: w.id, techId: me.id })}>Verify fix as {me.name.split(' ')[0]}</button>
+          : <span className="muted xs">Waiting for another tech to verify.</span>)
+        : <span className="muted xs">Fix submitted. Watching sensor data to confirm…</span>;
+      return <span className="green-text xs">✓ Fixed, verified and signed</span>;
+    };
+
+    const tabs: { id: typeof incTab; label: string; n?: number }[] = [
+      { id: 'overview', label: 'What to do' },
+      { id: 'impact', label: 'Impact' },
+      { id: 'routing', label: 'Who & why', n: chain.length || undefined },
+      { id: 'log', label: 'Log' },
+    ];
+
     return (
       <div className="split">
         <div className="list-pane">
@@ -417,78 +793,165 @@ export default function App() {
             ))}
           </div>
           {filtered.length === 0 && <p className="empty">Nothing here.</p>}
-          {filtered.map(w => (
-            <button key={w.id.toString()} className={`list-item ${selected?.id === w.id ? 'sel' : ''}`} onClick={() => setSelectedId(w.id)}>
-              <div className="row between"><b>{w.rackId} · {kindOf(w.kind).title}</b>{w.source === 'agent' && <Chip v="in_progress" label="AI" />}</div>
-              <div className="muted xs clamp">{w.message}</div>
-              <div className="row between xs"><span className="muted">{ago(w.createdAt)}</span><Chip v={w.status} label={w.status === 'open' ? 'unclaimed' : w.status} /></div>
-            </button>
-          ))}
+          {filtered.map(x => {
+            const p = incidentOf(x.id)?.priority ?? x.severity;
+            const route = x.status === 'open' ? routingLine(x.id) : '';
+            const byAgent = x.kind === 'power' && x.claimedBy === undefined && x.status !== 'open';
+            return (
+              <button key={x.id.toString()} className={`list-item li-${x.status === 'resolved' ? 'done' : p} ${w?.id === x.id ? 'sel' : ''}`} onClick={() => setSelectedId(x.id)}>
+                <div className="row between"><b>{x.rackId} · {kindOf(x.kind).title}</b>{x.source === 'agent' && <span className="ai-tag">AI</span>}</div>
+                <div className="row between xs">
+                  <span className="muted">{route || (byAgent ? 'Nemotron agent' : x.claimedBy !== undefined ? nameOf(x.claimedBy) : 'Unassigned')} · {ago(x.createdAt)}</span>
+                  <Chip v={x.status} label={x.status === 'open' ? 'unclaimed' : x.status} />
+                </div>
+              </button>
+            );
+          })}
         </div>
 
         <div className="detail-pane">
           {reportForm()}
-          {!selected ? <p className="empty">Select a warning.</p> : (
+          {!w || !km ? <p className="empty">Select a warning.</p> : (
             <>
-              <div className="row between wrap">
-                <h1>{selected.rackId} · {km?.title}</h1>
-                <div className="row"><Chip v={selected.severity} /><Chip v={selected.status} label={selected.status === 'open' ? 'unclaimed' : selected.status} /></div>
-              </div>
-              <p className="muted">{selected.message}</p>
-
-              <div className="stats three">
-                {reported
-                  ? <Stat label="Reported by" value={nameOf(selected.reportedBy)} />
-                  : selected.kind === 'cdu'
-                    ? (() => { const c = cdus.find(x => x.id === selected.rackId); return <Stat label="Coolant flow" value={c ? `${c.flowLpm.toFixed(0)} L/min` : '—'} sub={c ? `${c.pressureKpa.toFixed(0)} kPa · ${c.supplyTempC.toFixed(1)}°C` : ''} t={c && c.status !== 'ok' ? 'red' : 'green'} />; })()
-                    : selected.kind === 'pdu'
-                      ? <Stat label="PDU feeds" value={rack ? `A ${pduText(rack.pduAOnline, rack.pduALoadPct)} · B ${pduText(rack.pduBOnline, rack.pduBLoadPct)}` : '—'} t={rack && rack.pduAOnline && rack.pduBOnline ? 'green' : 'red'} />
-                      : <Stat label={`Current ${km?.label.toLowerCase()}`} value={fmt(selected.kind, rack)} t={rack && km?.read && km.read(rack) >= km.warn ? 'red' : 'green'} />}
-                <Stat label="Owner" value={selected.claimedBy !== undefined ? nameOf(selected.claimedBy) : 'Nobody'} t={selected.claimedBy === undefined ? 'red' : ''} />
-                <Stat label="Opened" value={ago(selected.createdAt)} sub={clock(selected.createdAt)} />
+              <div className="inc-head">
+                <div>
+                  <div className="row"><Chip v={done ? 'resolved' : prio} label={done ? 'resolved' : `${prio} priority`} />{w.source === 'agent' && <span className="ai-tag">Caught early by Nemotron</span>}</div>
+                  <h1>{w.rackId} · {km.title}</h1>
+                  <p className="muted xs">{w.message}</p>
+                </div>
+                {me?.role === 'supervisor' && inc && !done && (
+                  <select className="fault-pick" value="" onChange={e => e.target.value && overridePriority({ warningId: w.id, techId: me.id, priority: e.target.value })}>
+                    <option value="">override priority ▾</option>
+                    {['critical', 'medium', 'low'].map(p => <option key={p} value={p}>Set {p}</option>)}
+                  </select>
+                )}
               </div>
 
-              <div className="actions">
-                {selected.status === 'open' && <button className="primary" disabled={busy} onClick={() => me && claimWarning({ warningId: selected.id, techId: me.id })}>Claim & sign as {me?.name.split(' ')[0]}</button>}
-                {selected.status === 'claimed' && (mine
-                  ? <button className="primary" disabled={busy} onClick={() => me && markFixed({ warningId: selected.id, techId: me.id })}>Mark fix done</button>
-                  : <span className="muted xs">Only {nameOf(selected.claimedBy)} can mark this fixed.</span>)}
-                {selected.status === 'fixing' && !reported && <span className="muted xs">Watching sensor data to confirm the fix…</span>}
-                {selected.status === 'fixing' && reported && (me && selected.claimedBy !== me.id
-                  ? <button className="primary" disabled={busy} onClick={() => verifyFix({ warningId: selected.id, techId: me.id })}>Verify fix as {me.name.split(' ')[0]}</button>
-                  : <span className="muted xs">Waiting for another tech to verify (switch "acting as" at the bottom left)</span>)}
-                {selected.status === 'resolved' && <span className="green-text xs">✓ Verified and signed</span>}
-              </div>
-
-              <div className="panel">
-                <h3>Accountability trail</h3>
-                <div className="timeline">
-                  {life.map((s, i) => (
-                    <div key={i} className={`tl ${s.done ? 'done' : ''} ${s.current ? 'cur' : ''}`}>
-                      <div className="tl-dot">{s.done ? '✓' : ''}</div>
-                      <div><div className="tl-title">{s.label}</div><div className="muted xs">{s.detail}</div></div>
-                    </div>
-                  ))}
+              <div className={`strip ${done ? 'done' : ''}`}>
+                <div className={`cell ${!done && eta >= 0 && eta <= 10 ? 'bad' : ''}`}>
+                  <div className="cell-l">Time to critical</div>
+                  <div className="cell-v">{done ? '—' : etaTxt}</div>
+                  <div className="cell-s">{reading || (done ? 'resolved' : '')}</div>
+                </div>
+                <div className={`cell ${!done && inc?.slaAtRisk ? 'warn' : ''}`}>
+                  <div className="cell-l">Cost if down</div>
+                  <div className="cell-v">{inc?.costPerMinute ? `$${Math.round(inc.costPerMinute * 10).toLocaleString()}` : '—'}</div>
+                  <div className="cell-s">per 10 min{inc?.slaAtRisk ? ' · SLA at risk' : ''}</div>
+                </div>
+                <div className="cell">
+                  <div className="cell-l">Exposed</div>
+                  <div className="cell-v">{inc ? inc.affectedRacks.split(', ').filter(Boolean).length : 1} rack{inc && inc.affectedRacks.includes(',') ? 's' : ''}</div>
+                  <div className="cell-s">{tenantRows.length ? `${tenantRows.length} tenant${tenantRows.length > 1 ? 's' : ''}` : inc?.affectedRacks ?? w.rackId}</div>
+                </div>
+                <div className={`cell ${w.status === 'open' && !agentWorking ? 'bad' : ''}`}>
+                  <div className="cell-l">{agentFixed || agentWorking ? 'Handled by' : w.claimedBy !== undefined ? 'Owner' : live?.status === 'queued' ? 'Holding for' : live ? 'Paging' : 'Owner'}</div>
+                  <div className="cell-v sm">{agentFixed || agentWorking ? 'Nemotron agent' : w.claimedBy !== undefined ? nameOf(w.claimedBy) : live ? nameOf(live.techId) : 'Nobody'}</div>
+                  <div className="cell-s">{agentFixed ? 'nobody paged' : agentWorking ? 'fixing it now' : w.claimedBy !== undefined ? `took it after ${Math.round((toDate(w.claimedAt!).getTime() - toDate(w.createdAt).getTime()) / 1000)}s` : live?.status === 'paging' ? `escalates in ${secsLeft(live)}s` : live ? 'next shift' : ago(w.createdAt)}</div>
                 </div>
               </div>
 
-              <div className="panel">
-                <h3>Procedure steps</h3>
-                {steps.length === 0 ? <p className="empty">The Nemotron agent's plan will appear here.</p> : (
-                  <div className="timeline">
-                    {steps.map(s => (
-                      <div key={s.id.toString()} className={`tl ${s.status === 'done' ? 'done' : ''} ${s.status === 'in_progress' ? 'cur' : ''}`}>
-                        <div className="tl-dot">{s.status === 'done' ? '✓' : ''}</div>
-                        <div>
-                          <div className="row"><span className="tl-title">Step {s.stepNumber}</span><Chip v={s.executor === 'agent' ? 'in_progress' : 'pending'} label={s.executor === 'agent' ? 'agent' : 'technician'} /><Chip v={s.status} /></div>
-                          <div className="xs">{s.description}</div>
-                          {s.result && <div className="muted xxs">{s.result}</div>}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+              <div className="actions">{action()}</div>
+              {inc?.bumpReason && !done && <div className="bump xs"><b>Priority raised:</b> {inc.bumpReason.replace(/^Raised \w+ to \w+: /, '')}</div>}
+
+              <div className="tabs inc-tabs">
+                {tabs.map(t0 => <button key={t0.id} className={incTab === t0.id ? 'tab on' : 'tab'} onClick={() => setIncTab(t0.id)}>{t0.label}{t0.n ? <span className="count">{t0.n}</span> : null}</button>)}
               </div>
+
+              {incTab === 'overview' && (
+                <>
+                  <div className="panel ai-card">
+                    <div className="panel-head"><h3><span className="ai-dot" />Nemotron analysis</h3>{an && <span className="muted xxs">{an.confidence}% confident</span>}</div>
+                    {an ? (
+                      <>
+                        {an.callSenior && <div className="callout red xs">Low confidence: call a senior tech before acting on this.</div>}
+                        <p className="root">{an.rootCause}</p>
+                        <div className="conf"><div style={{ width: `${an.confidence}%` }} className={an.confidence < 60 ? 'low' : ''} /></div>
+                        <div className="kv xs"><span>Runbook</span><span>{an.runbook}</span></div>
+                        {inc?.similarFix && <div className="kv xs"><span>Done before</span><span>{inc.similarFix}</span></div>}
+                        {an.evidence && <details className="xs"><summary>Evidence from the sensors</summary><p className="muted">{an.evidence.split(' · ').map((e0, i) => <span key={i} className="ev">{e0}</span>)}</p></details>}
+                      </>
+                    ) : inc?.mode === 'symptom'
+                      ? <p className="muted xs">{inc.decision}</p>
+                      : <p className="empty">Nemotron is reading the sensor trail…</p>}
+                  </div>
+
+                  <div className="panel">
+                    <div className="panel-head"><h3>Fix steps</h3><span className="muted xxs">{verifyRule}</span></div>
+                    {steps.length === 0 ? <p className="empty">The plan will appear here.</p> : (
+                      <div className="checklist">
+                        {steps.map(s0 => (
+                          <div key={s0.id.toString()} className={`check ${s0.status === 'done' ? 'on' : ''}`}>
+                            <span className="box">{s0.status === 'done' ? '✓' : ''}</span>
+                            <div className="grow">
+                              <div className="xs">{s0.description}</div>
+                              {s0.result && s0.executor === 'agent' && <div className="faint xxs clamp">{s0.result}</div>}
+                            </div>
+                            <span className={`who ${s0.executor}`}>{s0.executor === 'agent' ? 'Agent' : 'Tech'}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {incTab === 'impact' && (
+                <div className="panel">
+                  {inc ? (
+                    <>
+                      <p className="xs">{inc.ifUnfixed}</p>
+                      <div className="kv xs"><span>Racks</span><span>{inc.affectedRacks}</span></div>
+                      {tenantRows.length > 0 && (
+                        <table className="tenants">
+                          <thead><tr><th>Tenant</th><th>Tier</th><th>SLA</th><th>Right now</th></tr></thead>
+                          <tbody>
+                            {tenantRows.map(r => (
+                              <tr key={r.name}>
+                                <td><b>{r.name}</b><div className="faint xxs">{r.tn?.workload}</div></td>
+                                <td>{r.tn?.tier}</td>
+                                <td>{r.tn ? `${r.tn.slaPct}%` : ''}</td>
+                                <td className="xs">
+                                  {r.sig?.url
+                                    ? <><span className={`news-score s${r.sig.score}`}>{['normal', 'watch', 'hot'][r.sig.score]}</span> <a className="chain-link" href={r.sig.url} target="_blank" rel="noreferrer">{r.sig.headline}</a> <span className="faint">via {r.sig.company}</span></>
+                                    : r.tn?.flagNote ? <span className="warn-text">{r.tn.flagNote}</span> : <span className="faint">nothing flagged</span>}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                      <p className="faint xxs">Sample tenants and assumed downtime rates. Headlines are real news about stand-in companies, not NMC² customers, scored by Nemotron.</p>
+                    </>
+                  ) : <p className="empty">No impact data for this one.</p>}
+                </div>
+              )}
+
+              {incTab === 'routing' && (
+                <div className="panel">
+                  {inc && <div className="row between" style={{ marginBottom: 6 }}><h3 style={{ margin: 0 }}>Routing decision</h3><Chip v={inc.mode} label={MODE_LABEL[inc.mode] ?? inc.mode} /></div>}
+                  {inc?.decision && <p className="xs">{inc.decision}</p>}
+                  {chain.length === 0 ? <p className="empty">{agentFixed || agentWorking ? 'Nobody was paged: the Nemotron agent handled it.' : 'Nobody has been paged for this.'}</p> : (
+                    <div className="pages">
+                      {chain.map((p, i) => {
+                        const t0 = techs.find(x => x.id === p.techId);
+                        return (
+                          <div key={p.id.toString()} className={`page-row ${p.status}`}>
+                            <span className="step-n">{i + 1}</span>
+                            <div className="avatar sm">{initials(nameOf(p.techId))}</div>
+                            <div className="grow">
+                              <div className="xs"><b>{nameOf(p.techId)}</b> <span className="muted">· {t0?.role} · {t0?.shift} shift</span></div>
+                              <div className="muted xxs">{p.reason}</div>
+                            </div>
+                            <Chip v={p.status} label={pageLabel(p)} />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {incTab === 'log' && incidentLog(w)}
             </>
           )}
         </div>
@@ -501,7 +964,7 @@ export default function App() {
       <div className="page-head"><div><h1>Racks</h1><p className="muted">Click "simulate fault" to break a rack's cooling for the demo.</p></div></div>
       <div className="rack-grid big">{sortedRacks.map(r => rackCard(r, true))}</div>
       <h2 className="section">Liquid cooling (CDUs)</h2>
-      <div className="rack-grid big">{sortedCdus.map(c => cduCard(c))}</div>
+      <div className="rack-grid big">{sortedCdus.map(c => cduCard(c, true))}</div>
     </>
   );
 
@@ -554,7 +1017,7 @@ export default function App() {
 
   const Record = () => (
     <>
-      <div className="page-head"><div><h1>Signed record</h1><p className="muted">Claims, verified fixes and handoffs. Each one is signed by the techs involved and written to Solana devnet, so nobody can change it later. Click a signature to see it on the Solana explorer.</p></div></div>
+      <div className="page-head"><div><h1>Signed record</h1><p className="muted">Pages, missed pages, claims, verified fixes and handoffs. Each one is signed by the techs involved and written to Solana devnet, so nobody can change it later. Click a signature to see it on the Solana explorer.</p></div></div>
       <div className="panel">
         <table>
           <thead><tr><th>Time</th><th>Event</th><th>Who</th><th>Details</th><th>Chain</th></tr></thead>
@@ -562,8 +1025,8 @@ export default function App() {
             {sortedRecords.map(rec => (
               <tr key={rec.id.toString()}>
                 <td className="muted">{clock(rec.createdAt)}</td>
-                <td><Chip v={rec.kind === 'fix_verified' ? 'resolved' : rec.kind === 'claim' ? 'claimed' : 'complete'} label={rec.kind.replace('_', ' ')} /></td>
-                <td>{rec.techIds.map(id => nameOf(id)).join(' + ') || 'system'}</td>
+                <td><Chip v={REC_TONE[rec.kind] ?? 'gray'} label={REC_LABEL[rec.kind] ?? rec.kind} /></td>
+                <td>{rec.techIds.map(id => nameOf(id)).join(' + ') || 'Night Watch'}</td>
                 <td>{rec.summary}</td>
                 <td className="mono">
                   {rec.txSignature
@@ -593,12 +1056,18 @@ export default function App() {
         </nav>
         <div className="side-foot">
           <div className="row xs"><span className={`live ${connected ? 'on' : ''}`} />{connected ? 'Live · Spacetime' : 'Disconnected'}</div>
+          <label className="row xs muted">On shift
+            <select className="fault-pick" value={shift} disabled={!connected} onChange={e => setShift({ shift: e.target.value })}>
+              <option value="night">Night</option>
+              <option value="day">Day</option>
+            </select>
+          </label>
           <button className="link xs" onClick={() => resetDemo()} disabled={!connected}>Reset demo data</button>
           <div className="me">
             <div className="avatar">{me ? initials(me.name) : '?'}</div>
             <div className="me-info">
               <select value={actingId} onChange={e => setActingId(e.target.value)}>
-                {techs.map(x => <option key={x.id.toString()} value={x.id.toString()}>{x.name}</option>)}
+                {techs.map(x => <option key={x.id.toString()} value={x.id.toString()}>{x.name}{pages.some(p => p.techId === x.id && p.status === 'paging') ? ' (paged)' : ''}</option>)}
               </select>
               <div className="muted xxs">{me ? `${me.role} · ${me.shift} shift` : ''}</div>
               {me?.walletPubkey && <div className="muted xxs mono" title={me.walletPubkey}>{me.walletPubkey.slice(0, 4)}…{me.walletPubkey.slice(-4)}</div>}
@@ -607,6 +1076,22 @@ export default function App() {
         </div>
       </aside>
       <main>
+        {myPages.map(p => {
+          const w = warnings.find(x => x.id === p.warningId);
+          if (!w || w.status !== 'open') return null;
+          if (view === 'warnings' && selected?.id === w.id) return null; // the incident page already has the button
+          return (
+            <div key={p.id.toString()} className="paged-banner">
+              <div className="grow">
+                <b>You're being paged: {w.rackId} · {kindOf(w.kind).title}</b>
+                <div className="xs">{incidentOf(w.id)?.ifUnfixed ?? w.message} Escalates in {secsLeft(p)}s if you don't respond.</div>
+              </div>
+              <button className="ghost sm" onClick={() => openWarning(w.id)}>Details</button>
+              <button className="ghost sm" disabled={busy} onClick={() => me && declinePage({ warningId: w.id, techId: me.id })}>Can't take it</button>
+              <button className="primary sm" disabled={busy} onClick={() => me && claimWarning({ warningId: w.id, techId: me.id })}>Acknowledge</button>
+            </div>
+          );
+        })}
         {view === 'overview' && Overview()}
         {view === 'warnings' && Warnings()}
         {view === 'racks' && Racks()}
@@ -623,6 +1108,7 @@ const css = `
     --text:#e6e8eb; --muted:#8a919b; --faint:#5d646e;
     --accent:#4f8cff; --accent-d:#3a6fd8;
     --ok:#3fb27f; --warn:#e0a43a; --bad:#e5534b; --info:#6aa1ff;
+    --violet:#a78bfa; --cyan:#22d3ee; --pink:#f472b6;
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:13.5px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing:antialiased; }
@@ -775,6 +1261,211 @@ const css = `
   .log-kind { color:var(--muted); font-weight:600; margin-right:6px; }
   .log-chain { font-size:10.5px; color:var(--faint); }
   .log-chain.on { color:var(--ok); }
+  .inc-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:14px; }
+  .inc-head h1 { margin:8px 0 2px; font-size:22px; }
+  .ai-tag { font-size:10.5px; font-weight:600; color:var(--info); border:1px solid rgba(106,161,255,.4); border-radius:4px; padding:1px 6px; }
+  .strip { display:grid; grid-template-columns:repeat(4,1fr); border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--line); gap:1px; }
+  .strip .cell { background:var(--panel); padding:12px 16px; }
+  .strip .cell.bad { box-shadow:inset 0 3px 0 var(--bad); }
+  .strip .cell.warn { box-shadow:inset 0 3px 0 var(--warn); }
+  .strip.done .cell { opacity:.75; }
+  .cell-l { font-size:11.5px; color:var(--muted); }
+  .cell-v { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-.01em; margin-top:2px; }
+  .cell-v.sm { font-size:17px; padding:3px 0 2px; }
+  .cell-s { font-size:11.5px; color:var(--faint); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .actions { margin:14px 0 8px; }
+  .bump { color:var(--warn); border-left:2px solid var(--warn); padding:4px 10px; margin:0 0 6px; }
+  .inc-tabs { margin:14px 0 14px; }
+  .inc-tabs .count { margin-left:6px; }
+  .ai-card { border-color:rgba(106,161,255,.3); }
+  .ai-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--info); margin-right:8px; vertical-align:1px; }
+  .root { font-size:15px; font-weight:600; margin:2px 0 8px; line-height:1.45; }
+  .kv { display:grid; grid-template-columns:96px 1fr; gap:10px; padding:7px 0; border-top:1px solid var(--line); }
+  .kv > span:first-child { color:var(--muted); }
+  details { margin-top:8px; } summary { cursor:pointer; color:var(--muted); } summary:hover { color:var(--text); }
+  .ev { display:block; padding:3px 0 3px 10px; border-left:2px solid var(--line2); margin:4px 0; }
+  .checklist { display:flex; flex-direction:column; gap:2px; }
+  .check { display:flex; gap:10px; align-items:flex-start; padding:8px 4px; border-bottom:1px solid var(--line); }
+  .check:last-child { border-bottom:0; }
+  .check .box { width:18px; height:18px; border-radius:4px; border:1.5px solid var(--line2); display:grid; place-items:center; font-size:11px; flex-shrink:0; margin-top:1px; }
+  .check.on .box { background:var(--ok); border-color:var(--ok); color:#0b0d10; font-weight:700; }
+  .check.on .xs { color:var(--muted); }
+  .who { font-size:10.5px; font-weight:600; border-radius:4px; padding:1px 6px; border:1px solid var(--line2); color:var(--muted); flex-shrink:0; }
+  .who.agent { color:var(--info); border-color:rgba(106,161,255,.4); }
+  .step-n { width:18px; text-align:center; color:var(--faint); font-size:12px; font-variant-numeric:tabular-nums; }
+  table.tenants { margin:10px 0 6px; } table.tenants td { vertical-align:top; }
+  .warn-text { color:var(--warn); }
+  .list-item { border-left:3px solid transparent; }
+  .list-item.li-critical { border-left-color:var(--bad); } .list-item.li-medium { border-left-color:var(--warn); } .list-item.li-low { border-left-color:var(--info); } .list-item.li-done { border-left-color:var(--line2); opacity:.7; }
+  .incident { max-width:880px; }
+  .progress { display:grid; grid-template-columns:repeat(4,1fr); gap:0; margin:6px 0 4px; border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
+  .pg { display:flex; gap:10px; align-items:flex-start; padding:12px 14px; border-right:1px solid var(--line); }
+  .pg:last-child { border-right:0; }
+  .pg-dot { width:22px; height:22px; border-radius:50%; border:2px solid var(--line2); display:grid; place-items:center; font-size:11px; font-weight:700; color:var(--faint); flex-shrink:0; }
+  .pg.done .pg-dot { background:var(--ok); border-color:var(--ok); color:#0b0d10; }
+  .pg.cur .pg-dot { border-color:var(--accent); color:var(--accent); }
+  .pg-l { font-weight:600; font-size:12.5px; }
+  .pg:not(.done):not(.cur) .pg-l { color:var(--muted); }
+  .pg-s { font-size:11.5px; color:var(--muted); }
+  .sec { margin-top:30px; }
+  .sec h2 { font-size:15px; font-weight:600; margin:0 0 10px; display:flex; align-items:center; gap:10px; letter-spacing:-.01em; }
+  .sec-n { width:22px; height:22px; border-radius:6px; background:var(--panel2); border:1px solid var(--line2); display:grid; place-items:center; font-size:12px; color:var(--muted); }
+  .story { font-size:14.5px; line-height:1.65; margin:0 0 14px; max-width:760px; }
+  .charts { display:grid; gap:12px; }
+  .charts.n2 { grid-template-columns:1fr 1fr; }
+  .chart { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px 10px; }
+  .chart-title { font-size:12px; color:var(--muted); margin-bottom:8px; }
+  .chart-box { position:relative; }
+  .mark-l { position:absolute; left:4px; font-size:10.5px; font-weight:600; background:var(--panel); padding:0 4px; border-radius:3px; }
+  .chart-foot > .faint { white-space:nowrap; }
+  .chart-foot { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:6px; font-size:11px; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; color:var(--muted); }
+  .legend i { display:inline-block; width:10px; height:3px; border-radius:2px; margin-right:5px; vertical-align:middle; }
+  .legend b { color:var(--text); font-variant-numeric:tabular-nums; }
+  .chart-empty { color:var(--faint); font-size:12px; padding:30px 0; text-align:center; }
+  .cause { display:flex; flex-wrap:wrap; align-items:stretch; gap:6px; margin-bottom:16px; }
+  .cause-step { display:flex; align-items:center; gap:6px; }
+  .cause-arrow { color:var(--faint); font-size:16px; }
+  .cause-node { border:1px solid var(--line2); border-left-width:3px; border-radius:8px; padding:8px 12px; background:var(--panel); min-width:130px; }
+  .cause-node.red { border-left-color:var(--bad); } .cause-node.amber { border-left-color:var(--warn); } .cause-node.green { border-left-color:var(--ok); }
+  .cn-l { font-weight:600; font-size:12.5px; }
+  .cn-s { font-size:11px; color:var(--muted); }
+  .checks { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .checks-head { margin-bottom:6px; }
+  .chk { display:flex; gap:10px; align-items:baseline; padding:6px 0; border-top:1px solid var(--line); }
+  .chk-i { width:16px; font-weight:700; flex-shrink:0; }
+  .chk.ok .chk-i { color:var(--ok); } .chk.no .chk-i { color:var(--bad); } .chk.no .xs { color:var(--muted); }
+  .conf-chip { font-size:11px; font-weight:600; border-radius:999px; padding:2px 10px; border:1px solid; }
+  .conf-chip.high { color:var(--ok); border-color:rgba(63,178,127,.45); }
+  .conf-chip.medium { color:var(--warn); border-color:rgba(224,164,58,.45); }
+  .conf-chip.low { color:var(--bad); border-color:rgba(229,83,75,.5); }
+  .plan { list-style:none; margin:8px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+  .plan li { display:flex; gap:12px; align-items:flex-start; border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--panel); }
+  .plan li.now { border-color:var(--accent); box-shadow:inset 3px 0 0 var(--accent); }
+  .plan li.on { opacity:.7; }
+  .plan-box { width:22px; height:22px; border-radius:6px; border:1.5px solid var(--line2); display:grid; place-items:center; font-size:11.5px; font-weight:700; color:var(--muted); flex-shrink:0; }
+  .plan li.on .plan-box { background:var(--ok); border-color:var(--ok); color:#0b0d10; }
+  .plan li.now .plan-box { border-color:var(--accent); color:var(--accent); }
+  .plan-t { font-size:13.5px; }
+  .plan-r { font-size:12px; color:var(--muted); margin-top:3px; }
+  .details { border-top:1px solid var(--line); padding-top:6px; }
+  .details .strip { grid-template-columns:repeat(3,1fr); margin-bottom:6px; }
+  .hero { display:flex; align-items:center; gap:20px; border:1px solid var(--line2); border-radius:12px; padding:18px 22px; margin-bottom:16px; background:var(--panel); position:relative; overflow:hidden; }
+  .hero::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--faint); }
+  .hero.bad::before { background:var(--bad); } .hero.warn::before { background:var(--warn); } .hero.ok::before { background:var(--ok); }
+  .hero.bad { border-color:rgba(229,83,75,.45); background:linear-gradient(90deg, rgba(229,83,75,.09), transparent 42%), var(--panel); }
+  .hero.warn { border-color:rgba(224,164,58,.4); background:linear-gradient(90deg, rgba(224,164,58,.08), transparent 42%), var(--panel); }
+  .hero.ok { border-color:rgba(63,178,127,.35); }
+  .hero-main { flex:1; min-width:0; }
+  .hero-eyebrow { font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+  .hero.bad .hero-eyebrow { color:var(--bad); } .hero.warn .hero-eyebrow { color:var(--warn); } .hero.ok .hero-eyebrow { color:var(--ok); }
+  .hero-title { font-size:23px; font-weight:600; letter-spacing:-.02em; margin:3px 0 4px; }
+  .hero-sub { font-size:13px; color:var(--muted); }
+  .hero-burn { text-align:right; padding-right:20px; border-right:1px solid var(--line); flex-shrink:0; }
+  .hero-burn-v { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-.01em; }
+  .hero.bad .hero-burn-v { color:var(--bad); }
+  .hero-burn-l { font-size:11px; color:var(--muted); }
+  .hero-act { display:flex; gap:8px; flex-shrink:0; }
+  .hero-act .ghost, .hero-act .primary { padding:9px 14px; }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--faint); } .dot.ok { background:var(--ok); opacity:.65; }
+  .rack-grid { grid-template-columns:repeat(auto-fill,minmax(148px,1fr)); }
+  .rack .spark { margin:4px 0 6px; }
+  .rack-temp { margin:6px 0 0; }
+  .tile-foot { display:flex; justify-content:space-between; align-items:baseline; gap:8px; font-size:11px; }
+  .tile-foot > span:first-child { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rack.big .tile-foot { margin-top:6px; }
+  .floor-sum { gap:14px; font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .floor-sum span + span::before { content:'·'; margin-right:14px; color:var(--line2); }
+  .warn-text { color:var(--warn); }
+  .q-row.sub { margin-left:18px; opacity:.72; border-left-width:2px; }
+  .q-row.sub .q-title b { font-weight:500; }
+  .fault-pick { max-width:74px; opacity:.55; }
+  .fault-pick:hover { opacity:1; }
+  .rack.big .fault-pick { max-width:120px; }
+  .q-kids { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--faint); margin:-2px 0 6px 14px; padding:5px 10px; cursor:pointer; }
+  .q-kids:hover { color:var(--muted); }
+  .q-kids-br { width:12px; height:8px; border-left:1px solid var(--line2); border-bottom:1px solid var(--line2); border-bottom-left-radius:4px; margin-top:-8px; flex-shrink:0; }
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
+  .kpi { border-radius:10px; padding:13px 16px; border:1px solid; position:relative; overflow:hidden; }
+  .kpi::after { content:''; position:absolute; right:-18px; top:-18px; width:66px; height:66px; border-radius:50%; opacity:.1; }
+  .kpi-l { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
+  .kpi-v { font-size:27px; font-weight:600; letter-spacing:-.02em; font-variant-numeric:tabular-nums; margin:2px 0 1px; color:var(--text); }
+  .kpi-s { font-size:11.5px; color:var(--muted); }
+  .kpi.violet { border-color:rgba(167,139,250,.35); background:linear-gradient(160deg, rgba(167,139,250,.14), rgba(167,139,250,.03)); }
+  .kpi.violet .kpi-l { color:var(--violet); } .kpi.violet::after { background:var(--violet); }
+  .kpi.green { border-color:rgba(63,178,127,.35); background:linear-gradient(160deg, rgba(63,178,127,.14), rgba(63,178,127,.03)); }
+  .kpi.green .kpi-l { color:var(--ok); } .kpi.green::after { background:var(--ok); }
+  .kpi.amber { border-color:rgba(224,164,58,.35); background:linear-gradient(160deg, rgba(224,164,58,.14), rgba(224,164,58,.03)); }
+  .kpi.amber .kpi-l { color:var(--warn); } .kpi.amber::after { background:var(--warn); }
+  .kpi.cyan { border-color:rgba(34,211,238,.32); background:linear-gradient(160deg, rgba(34,211,238,.13), rgba(34,211,238,.03)); }
+  .kpi.cyan .kpi-l { color:var(--cyan); } .kpi.cyan::after { background:var(--cyan); }
+
+  .aisle { display:flex; align-items:stretch; gap:10px; margin-bottom:8px; }
+  .aisle-l { width:52px; flex-shrink:0; font-size:11.5px; color:var(--muted); align-self:center; }
+  .cdu-chip { width:52px; flex-shrink:0; border-radius:7px; border:1px solid rgba(34,211,238,.3); background:rgba(34,211,238,.09); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1px; }
+  .cdu-chip.bad { border-color:rgba(229,83,75,.5); background:rgba(229,83,75,.12); }
+  .cdu-chip-n { font-size:14px; font-weight:600; color:var(--cyan); font-variant-numeric:tabular-nums; line-height:1.1; }
+  .cdu-chip.bad .cdu-chip-n { color:var(--bad); }
+  .cdu-chip-l { font-size:9px; color:var(--muted); letter-spacing:.02em; }
+  .aisle-racks { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; flex:1; }
+  .heat { border-radius:7px; padding:9px 11px; cursor:pointer; border:1px solid rgba(255,255,255,.07); transition:transform .12s; }
+  .heat:hover { transform:translateY(-1px); border-color:rgba(255,255,255,.2); }
+  .heat.warning { box-shadow:0 0 0 1px rgba(224,164,58,.55); }
+  .heat.nopower { box-shadow:0 0 0 1px rgba(224,164,58,.7); }
+  .heat.critical, .heat.down { box-shadow:0 0 0 1px rgba(229,83,75,.75); }
+  .heat.nopower .heat-tn { color:var(--warn); font-weight:600; }
+  .heat-id { font-size:11px; font-weight:600; color:rgba(255,255,255,.72); }
+  .heat-t { font-size:19px; font-weight:600; letter-spacing:-.01em; font-variant-numeric:tabular-nums; color:#fff; line-height:1.15; }
+  .heat-tn { font-size:10px; color:rgba(255,255,255,.55); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .heat-key { gap:7px; }
+  .heat-bar { width:88px; height:7px; border-radius:4px; background:linear-gradient(90deg, hsl(205 45% 26%), hsl(120 55% 30%), hsl(45 72% 36%), hsl(0 85% 42%)); }
+  .ok-text { color:var(--ok); }
+  .floor-sum { margin-top:12px; padding-top:11px; border-top:1px solid var(--line); font-size:11.5px; font-variant-numeric:tabular-nums; }
+  .floor-sum span::before { content:none; }
+  .log-kind.k-paged, .log-kind.k-page_held { color:var(--warn); }
+  .log-kind.k-page_missed, .log-kind.k-page_declined { color:var(--bad); }
+  .log-kind.k-claim { color:var(--info); }
+  .log-kind.k-fix_verified { color:var(--ok); }
+  .log-kind.k-agent_action { color:var(--violet); }
+  .log-kind.k-handoff { color:var(--cyan); }
+  .log-chain.on { color:var(--cyan); }
+  .nav.on { box-shadow:inset 2px 0 0 var(--violet); }
+  .nav em { background:var(--bad); }
+  .cmp.idle { padding:12px 16px; }
+  .cmp-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .cmp-side { border:1px solid var(--line); border-radius:8px; padding:12px 14px; background:var(--panel2); }
+  .cmp-side.running { border-color:rgba(229,83,75,.5); }
+  .cmp-side.done { border-color:rgba(63,178,127,.45); }
+  .cmp-big { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; margin:2px 0; }
+  .news { display:flex; gap:8px; align-items:baseline; margin-top:6px; }
+  .news-score { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; border:1px solid var(--line2); border-radius:3px; padding:0 5px; color:var(--muted); flex-shrink:0; }
+  .news-score.s1 { color:var(--warn); border-color:rgba(224,164,58,.4); }
+  .news-score.s2 { color:var(--bad); border-color:rgba(229,83,75,.45); }
+  .ilog { display:flex; flex-direction:column; }
+  .ilog-row { display:grid; grid-template-columns:96px 10px 1fr; gap:10px; align-items:baseline; padding:6px 0; border-bottom:1px solid var(--line); }
+  .ilog-row:last-child { border-bottom:0; }
+  .ilog-row .log-time { white-space:nowrap; }
+  .ilog-dot { width:7px; height:7px; border-radius:50%; background:var(--faint); }
+  .ilog-dot.red { background:var(--bad); } .ilog-dot.amber { background:var(--warn); } .ilog-dot.green { background:var(--ok); } .ilog-dot.blue { background:var(--info); }
+  .stats.tight { margin:4px 0 12px; }
+  .faint { color:var(--faint); }
+  .callout { border-radius:6px; padding:8px 10px; margin-top:8px; border:1px solid; }
+  .callout.green { color:var(--ok); border-color:rgba(63,178,127,.4); background:rgba(63,178,127,.06); margin:0 0 10px; }
+  .callout.amber { color:var(--warn); border-color:rgba(224,164,58,.4); background:rgba(224,164,58,.06); }
+  .callout.red { color:var(--bad); border-color:rgba(229,83,75,.45); background:rgba(229,83,75,.06); margin:0 0 10px; }
+  .pages { display:flex; flex-direction:column; gap:6px; margin-top:10px; }
+  .page-row { display:flex; gap:10px; align-items:center; border:1px solid var(--line); border-radius:6px; padding:8px 10px; background:var(--panel2); }
+  .page-row.paging { border-color:rgba(224,164,58,.45); }
+  .page-row.acknowledged { border-color:rgba(63,178,127,.4); }
+  .page-row.missed, .page-row.declined { opacity:.75; }
+  .avatar.sm { width:26px; height:26px; font-size:10px; }
+  .primary.sm, .ghost.sm { padding:5px 10px; font-size:12px; }
+  .ghost { background:none; border:1px solid var(--line2); border-radius:6px; color:var(--text); cursor:pointer; font-weight:500; }
+  .ghost:hover:not(:disabled) { border-color:var(--muted); }
+  .conf { height:4px; background:var(--line); border-radius:2px; overflow:hidden; margin-top:8px; }
+  .conf div { height:100%; background:var(--ok); } .conf div.low { background:var(--bad); }
+  .paged-banner { display:flex; gap:10px; align-items:center; border:1px solid rgba(224,164,58,.5); background:rgba(224,164,58,.08); border-radius:8px; padding:10px 14px; margin-bottom:14px; }
+  .paged-banner b { color:var(--warn); }
   .section { font-size:11.5px; margin:24px 0 10px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
 
   @media (max-width: 900px) {

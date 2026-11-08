@@ -35,17 +35,26 @@ import {
 
 // Import all reducer arg schemas
 import AddTaskReducer from "./add_task_reducer";
+import AgentMoveJobReducer from "./agent_move_job_reducer";
 import BreakCduReducer from "./break_cdu_reducer";
 import BreakRackReducer from "./break_rack_reducer";
 import ClaimWarningReducer from "./claim_warning_reducer";
 import CreateHandoffReducer from "./create_handoff_reducer";
+import DeclinePageReducer from "./decline_page_reducer";
 import MarkFixedReducer from "./mark_fixed_reducer";
+import OverridePriorityReducer from "./override_priority_reducer";
 import RaiseWarningReducer from "./raise_warning_reducer";
 import ReportIssueReducer from "./report_issue_reducer";
 import ResetDemoReducer from "./reset_demo_reducer";
+import SetAnalysisReducer from "./set_analysis_reducer";
+import SetChainProofReducer from "./set_chain_proof_reducer";
+import SetShiftReducer from "./set_shift_reducer";
 import SetTechWalletReducer from "./set_tech_wallet_reducer";
+import SetTenantSignalReducer from "./set_tenant_signal_reducer";
 import SetTxSignatureReducer from "./set_tx_signature_reducer";
 import SignHandoffReducer from "./sign_handoff_reducer";
+import StartComparisonReducer from "./start_comparison_reducer";
+import StopComparisonReducer from "./stop_comparison_reducer";
 import UpdateHandoffBriefReducer from "./update_handoff_brief_reducer";
 import UpdateTaskReducer from "./update_task_reducer";
 import VerifyFixReducer from "./verify_fix_reducer";
@@ -53,20 +62,41 @@ import VerifyFixReducer from "./verify_fix_reducer";
 // Import all procedure arg schemas
 
 // Import all table schema definitions
+import AnalysisRow from "./analysis_table";
 import CduRow from "./cdu_table";
 import CduReadingRow from "./cdu_reading_table";
+import ChainLinkRow from "./chain_link_table";
 import ChainRecordRow from "./chain_record_table";
+import ExperimentRow from "./experiment_table";
+import FloorRow from "./floor_table";
 import HandoffRow from "./handoff_table";
+import IncidentRow from "./incident_table";
+import PageRow from "./page_table";
+import PastFixRow from "./past_fix_table";
 import RackRow from "./rack_table";
 import SensorReadingRow from "./sensor_reading_table";
 import TaskRow from "./task_table";
 import TechRow from "./tech_table";
+import TechProfileRow from "./tech_profile_table";
+import TenantRow from "./tenant_table";
+import TenantSignalRow from "./tenant_signal_table";
 import WarningRow from "./warning_table";
 
 /** Type-only namespace exports for generated type groups. */
 
 /** The schema information for all tables in this module. This is defined the same was as the tables would have been defined in the server. */
 const tablesSchema = __schema({
+  analysis: __table({
+    name: 'analysis',
+    indexes: [
+      { accessor: 'warningId', name: 'analysis_warning_id_idx_btree', algorithm: 'btree', columns: [
+        'warningId',
+      ] },
+    ],
+    constraints: [
+      { name: 'analysis_warning_id_key', constraint: 'unique', columns: ['warningId'] },
+    ],
+  }, AnalysisRow),
   cdu: __table({
     name: 'cdu',
     indexes: [
@@ -92,6 +122,17 @@ const tablesSchema = __schema({
       { name: 'cdu_reading_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, CduReadingRow),
+  chainLink: __table({
+    name: 'chain_link',
+    indexes: [
+      { accessor: 'recordId', name: 'chain_link_record_id_idx_btree', algorithm: 'btree', columns: [
+        'recordId',
+      ] },
+    ],
+    constraints: [
+      { name: 'chain_link_record_id_key', constraint: 'unique', columns: ['recordId'] },
+    ],
+  }, ChainLinkRow),
   chainRecord: __table({
     name: 'chain_record',
     indexes: [
@@ -103,6 +144,28 @@ const tablesSchema = __schema({
       { name: 'chain_record_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, ChainRecordRow),
+  experiment: __table({
+    name: 'experiment',
+    indexes: [
+      { accessor: 'id', name: 'experiment_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'experiment_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, ExperimentRow),
+  floor: __table({
+    name: 'floor',
+    indexes: [
+      { accessor: 'id', name: 'floor_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'floor_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, FloorRow),
   handoff: __table({
     name: 'handoff',
     indexes: [
@@ -114,6 +177,45 @@ const tablesSchema = __schema({
       { name: 'handoff_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, HandoffRow),
+  incident: __table({
+    name: 'incident',
+    indexes: [
+      { accessor: 'warningId', name: 'incident_warning_id_idx_btree', algorithm: 'btree', columns: [
+        'warningId',
+      ] },
+    ],
+    constraints: [
+      { name: 'incident_warning_id_key', constraint: 'unique', columns: ['warningId'] },
+    ],
+  }, IncidentRow),
+  page: __table({
+    name: 'page',
+    indexes: [
+      { accessor: 'id', name: 'page_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'warningId', name: 'page_warning_id_idx_btree', algorithm: 'btree', columns: [
+        'warningId',
+      ] },
+    ],
+    constraints: [
+      { name: 'page_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, PageRow),
+  pastFix: __table({
+    name: 'past_fix',
+    indexes: [
+      { accessor: 'id', name: 'past_fix_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'techId', name: 'past_fix_tech_id_idx_btree', algorithm: 'btree', columns: [
+        'techId',
+      ] },
+    ],
+    constraints: [
+      { name: 'past_fix_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, PastFixRow),
   rack: __table({
     name: 'rack',
     indexes: [
@@ -164,6 +266,39 @@ const tablesSchema = __schema({
       { name: 'tech_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TechRow),
+  techProfile: __table({
+    name: 'tech_profile',
+    indexes: [
+      { accessor: 'techId', name: 'tech_profile_tech_id_idx_btree', algorithm: 'btree', columns: [
+        'techId',
+      ] },
+    ],
+    constraints: [
+      { name: 'tech_profile_tech_id_key', constraint: 'unique', columns: ['techId'] },
+    ],
+  }, TechProfileRow),
+  tenant: __table({
+    name: 'tenant',
+    indexes: [
+      { accessor: 'id', name: 'tenant_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'tenant_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, TenantRow),
+  tenantSignal: __table({
+    name: 'tenant_signal',
+    indexes: [
+      { accessor: 'tenantId', name: 'tenant_signal_tenant_id_idx_btree', algorithm: 'btree', columns: [
+        'tenantId',
+      ] },
+    ],
+    constraints: [
+      { name: 'tenant_signal_tenant_id_key', constraint: 'unique', columns: ['tenantId'] },
+    ],
+  }, TenantSignalRow),
   warning: __table({
     name: 'warning',
     indexes: [
@@ -183,17 +318,26 @@ const tablesSchema = __schema({
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
   __reducerSchema("add_task", AddTaskReducer),
+  __reducerSchema("agent_move_job", AgentMoveJobReducer),
   __reducerSchema("break_cdu", BreakCduReducer),
   __reducerSchema("break_rack", BreakRackReducer),
   __reducerSchema("claim_warning", ClaimWarningReducer),
   __reducerSchema("create_handoff", CreateHandoffReducer),
+  __reducerSchema("decline_page", DeclinePageReducer),
   __reducerSchema("mark_fixed", MarkFixedReducer),
+  __reducerSchema("override_priority", OverridePriorityReducer),
   __reducerSchema("raise_warning", RaiseWarningReducer),
   __reducerSchema("report_issue", ReportIssueReducer),
   __reducerSchema("reset_demo", ResetDemoReducer),
+  __reducerSchema("set_analysis", SetAnalysisReducer),
+  __reducerSchema("set_chain_proof", SetChainProofReducer),
+  __reducerSchema("set_shift", SetShiftReducer),
   __reducerSchema("set_tech_wallet", SetTechWalletReducer),
+  __reducerSchema("set_tenant_signal", SetTenantSignalReducer),
   __reducerSchema("set_tx_signature", SetTxSignatureReducer),
   __reducerSchema("sign_handoff", SignHandoffReducer),
+  __reducerSchema("start_comparison", StartComparisonReducer),
+  __reducerSchema("stop_comparison", StopComparisonReducer),
   __reducerSchema("update_handoff_brief", UpdateHandoffBriefReducer),
   __reducerSchema("update_task", UpdateTaskReducer),
   __reducerSchema("verify_fix", VerifyFixReducer),

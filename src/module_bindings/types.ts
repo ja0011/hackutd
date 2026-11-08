@@ -10,6 +10,17 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
+export const Analysis = __t.object("Analysis", {
+  warningId: __t.u64(),
+  rootCause: __t.string(),
+  evidence: __t.string(),
+  runbook: __t.string(),
+  confidence: __t.u32(),
+  callSenior: __t.bool(),
+  createdAt: __t.timestamp(),
+});
+export type Analysis = __Infer<typeof Analysis>;
+
 export const Cdu = __t.object("Cdu", {
   id: __t.string(),
   aisle: __t.string(),
@@ -31,6 +42,14 @@ export const CduReading = __t.object("CduReading", {
 });
 export type CduReading = __Infer<typeof CduReading>;
 
+export const ChainLink = __t.object("ChainLink", {
+  recordId: __t.u64(),
+  chainKey: __t.string(),
+  sha256: __t.string(),
+  prevSha256: __t.string(),
+});
+export type ChainLink = __Infer<typeof ChainLink>;
+
 export const ChainRecord = __t.object("ChainRecord", {
   id: __t.u64(),
   kind: __t.string(),
@@ -41,6 +60,23 @@ export const ChainRecord = __t.object("ChainRecord", {
   txSignature: __t.string(),
 });
 export type ChainRecord = __Infer<typeof ChainRecord>;
+
+export const Experiment = __t.object("Experiment", {
+  id: __t.string(),
+  active: __t.bool(),
+  startedAt: __t.timestamp(),
+  baselineCdu: __t.string(),
+  pagedCdu: __t.string(),
+  baselineWarningId: __t.u64(),
+  pagedWarningId: __t.u64(),
+});
+export type Experiment = __Infer<typeof Experiment>;
+
+export const Floor = __t.object("Floor", {
+  id: __t.string(),
+  currentShift: __t.string(),
+});
+export type Floor = __Infer<typeof Floor>;
 
 export const Handoff = __t.object("Handoff", {
   id: __t.u64(),
@@ -54,6 +90,47 @@ export const Handoff = __t.object("Handoff", {
   status: __t.string(),
 });
 export type Handoff = __Infer<typeof Handoff>;
+
+export const Incident = __t.object("Incident", {
+  warningId: __t.u64(),
+  basePriority: __t.string(),
+  priority: __t.string(),
+  bumpReason: __t.string(),
+  overriddenBy: __t.option(__t.u64()),
+  minutesToCritical: __t.f64(),
+  affectedRacks: __t.string(),
+  tenants: __t.string(),
+  costPerMinute: __t.f64(),
+  slaAtRisk: __t.bool(),
+  ifUnfixed: __t.string(),
+  similarFix: __t.string(),
+  mode: __t.string(),
+  decision: __t.string(),
+});
+export type Incident = __Infer<typeof Incident>;
+
+export const Page = __t.object("Page", {
+  id: __t.u64(),
+  warningId: __t.u64(),
+  techId: __t.u64(),
+  round: __t.u32(),
+  status: __t.string(),
+  pagedAt: __t.timestamp(),
+  ackAt: __t.option(__t.timestamp()),
+  timeoutSec: __t.u32(),
+  reason: __t.string(),
+});
+export type Page = __Infer<typeof Page>;
+
+export const PastFix = __t.object("PastFix", {
+  id: __t.u64(),
+  techId: __t.u64(),
+  kind: __t.string(),
+  minutes: __t.u32(),
+  daysAgo: __t.u32(),
+  summary: __t.string(),
+});
+export type PastFix = __Infer<typeof PastFix>;
 
 export const Rack = __t.object("Rack", {
   id: __t.string(),
@@ -111,6 +188,38 @@ export const Tech = __t.object("Tech", {
   walletPubkey: __t.string(),
 });
 export type Tech = __Infer<typeof Tech>;
+
+export const TechProfile = __t.object("TechProfile", {
+  techId: __t.u64(),
+  skills: __t.string(),
+});
+export type TechProfile = __Infer<typeof TechProfile>;
+
+export const Tenant = __t.object("Tenant", {
+  id: __t.u64(),
+  name: __t.string(),
+  workload: __t.string(),
+  tier: __t.string(),
+  slaPct: __t.f64(),
+  downtimeCostPerHour: __t.f64(),
+  rackIds: __t.string(),
+  flagLevel: __t.u32(),
+  flagNote: __t.string(),
+});
+export type Tenant = __Infer<typeof Tenant>;
+
+export const TenantSignal = __t.object("TenantSignal", {
+  tenantId: __t.u64(),
+  company: __t.string(),
+  headline: __t.string(),
+  url: __t.string(),
+  source: __t.string(),
+  publishedAt: __t.string(),
+  score: __t.u32(),
+  note: __t.string(),
+  checkedAt: __t.timestamp(),
+});
+export type TenantSignal = __Infer<typeof TenantSignal>;
 
 export const Warning = __t.object("Warning", {
   id: __t.u64(),

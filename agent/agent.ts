@@ -142,27 +142,52 @@ function cduSeries(conn: Conn, cduId: string, n = 12) {
 }
 
 // Tool the agent can run on its own: read live telemetry for a rack or a CDU.
+// Readings arrive every 3 seconds, so 20 readings = 1 minute. Rates are reported per minute.
+const PER_MIN = 20;
+const rate = (xs: number[]) => slope(xs) * PER_MIN;
+const signed = (x: number, d = 0) => `${x > 0 ? '+' : ''}${x.toFixed(d)}`;
 function telemetryTool(conn: Conn, id: string, focus?: string) {
   const c = conn.db.cdu.id.find(id);
   if (c) {
-    const h = cduSeries(conn, id, 6);
-    const fl = slope(h.map(x => x.flowLpm));
-    const pr = slope(h.map(x => x.pressureKpa));
-    const racks = [...conn.db.rack.iter()].filter(r => r.aisle === c.aisle).map(r => `${r.id} ${r.temperatureF.toFixed(1)}°F`);
-    return `Telemetry ${id}: coolant flow ${c.flowLpm.toFixed(0)} L/min (${fl.toFixed(1)}/reading), pressure ${c.pressureKpa.toFixed(0)} kPa (${pr.toFixed(1)}/reading), coolant supply ${c.supplyTempC.toFixed(1)}°C. Cools racks: ${racks.join(', ')}.`;
+    const h = cduSeries(conn, id, 10);
+    const racks = [...conn.db.rack.iter()].filter(r => r.aisle === c.aisle).map(r => `${r.id} ${r.temperatureF.toFixed(1)}°F (${signed(rate(history(conn, r.id, 'cooling', 10)), 1)}°F/min)`);
+    const others = [...conn.db.rack.iter()].filter(r => r.aisle !== c.aisle).map(r => r.temperatureF);
+    const otherAvg = others.length ? others.reduce((a, b) => a + b, 0) / others.length : 0;
+    return `Telemetry ${id}: coolant flow ${c.flowLpm.toFixed(0)} L/min (${signed(rate(h.map(x => x.flowLpm)))} L/min per minute; normal ~120), pressure ${c.pressureKpa.toFixed(0)} kPa (${signed(rate(h.map(x => x.pressureKpa)))} kPa per minute; normal ~210), coolant supply ${c.supplyTempC.toFixed(1)}°C. Racks it cools: ${racks.join(', ')}. Racks in other aisles average ${otherAvg.toFixed(1)}°F.`;
   }
   const r = conn.db.rack.id.find(id);
   if (!r) return 'Not found.';
   const parts = KIND_LIST.filter(k => k !== 'pdu').map(k => {
     const s = SENSORS[k];
-    const tr = slope(history(conn, id, k, 6));
-    return `${s.name} ${s.read(r).toFixed(1)}${s.unit === '°F' ? '°F' : ' ' + s.unit}${Math.abs(tr) > s.trend / 2 ? ` (${tr > 0 ? '+' : ''}${tr.toFixed(2)}/reading)` : ''}`;
+    const tr = rate(history(conn, id, k, 10));
+    return `${s.name} ${s.read(r).toFixed(1)}${s.unit === '°F' ? '°F' : ' ' + s.unit}${Math.abs(tr) > (s.trend * PER_MIN) / 4 ? ` (${signed(tr, 1)} per minute)` : ''}`;
   });
   const pdu = `PDU A ${r.pduAOnline ? r.pduALoadPct.toFixed(0) + '%' : 'OFFLINE'}, PDU B ${r.pduBOnline ? r.pduBLoadPct.toFixed(0) + '%' : 'OFFLINE'}`;
   const aisleCdu = conn.db.cdu.id.find(`CDU-${r.aisle}`);
-  const cool = aisleCdu ? `, aisle CDU-${r.aisle} flow ${aisleCdu.flowLpm.toFixed(0)} L/min` : '';
+  const cool = aisleCdu ? `, aisle CDU-${r.aisle} coolant flow ${aisleCdu.flowLpm.toFixed(0)} L/min (normal ~120)` : '';
+  const neighbors = [...conn.db.rack.iter()].filter(x => x.aisle === r.aisle && x.id !== r.id).map(x => `${x.id} ${x.temperatureF.toFixed(1)}°F`);
   // (The simulator's hidden fault flag is never shown to the agent — it has to read the numbers like a real one.)
-  return `Telemetry ${id}${focus ? ` [${focus}]` : ''}: ${parts.join(', ')}, ${pdu}${cool}.`;
+  return `Telemetry ${id}${focus ? ` [${focus}]` : ''}: ${parts.join(', ')}, ${pdu}${cool}. Neighbor racks: ${neighbors.join(', ')}.`;
+}
+
+// The same readings in a sentence a technician can read at a glance (shown as the agent's step result).
+function plainReadout(conn: Conn, id: string) {
+  const c = conn.db.cdu.id.find(id);
+  if (c) {
+    const fr = rate(cduSeries(conn, id, 10).map(x => x.flowLpm));
+    const racks = [...conn.db.rack.iter()].filter(r => r.aisle === c.aisle);
+    const temps = racks.map(r => r.temperatureF);
+    const flowTxt = Math.abs(fr) < 3 ? 'steady' : fr < 0 ? `falling about ${Math.abs(fr).toFixed(0)} L/min each minute` : `recovering about ${fr.toFixed(0)} L/min each minute`;
+    return `Checked ${id}: coolant flow is ${c.flowLpm.toFixed(0)} L/min (normal is about 120) and ${flowTxt}. The ${racks.length} racks it cools are at ${Math.min(...temps).toFixed(0) === Math.max(...temps).toFixed(0) ? Math.max(...temps).toFixed(0) : `${Math.min(...temps).toFixed(0)}–${Math.max(...temps).toFixed(0)}`}°F.`;
+  }
+  const r = conn.db.rack.id.find(id);
+  if (!r) return 'Checked: not found.';
+  const tr = rate(history(conn, id, 'cooling', 10));
+  const tTxt = Math.abs(tr) < 0.5 ? 'steady' : tr > 0 ? `rising about ${tr.toFixed(1)}°F each minute` : `cooling about ${Math.abs(tr).toFixed(1)}°F each minute`;
+  const feeds = r.pduAOnline && r.pduBOnline ? `both power feeds up (${r.pduALoadPct.toFixed(0)}% each)` : !r.pduAOnline && !r.pduBOnline ? 'no power on either feed' : `only feed ${r.pduAOnline ? 'A' : 'B'} up, at ${Math.max(r.pduALoadPct, r.pduBLoadPct).toFixed(0)}% load`;
+  const cdu = conn.db.cdu.id.find(`CDU-${r.aisle}`);
+  const coolTxt = cdu ? (cdu.flowLpm >= 105 ? `aisle coolant normal (${cdu.flowLpm.toFixed(0)} L/min)` : `aisle coolant low (${cdu.flowLpm.toFixed(0)} L/min)`) : '';
+  return `Checked ${id}: ${r.temperatureF.toFixed(1)}°F and ${tTxt}; ${feeds}${coolTxt ? `; ${coolTxt}` : ''}.`;
 }
 
 // ─── 1. early warning ─────────────────────────────────────
@@ -197,14 +222,16 @@ async function scan(conn: Conn) {
         suspects.push({ rackId: c.id, kind: 'cdu' as Kind, series: flow, extra: `pressure kPa: ${pres.join(', ')}; racks cooled: ${[...conn.db.rack.iter()].filter(r => r.aisle === c.aisle).map(r => r.id).join(', ')}` });
       }
     }
+    // Runaway jobs the agent is waiting to fix (it acts once the spike is clearly real).
+    for (const w of conn.db.warning.iter()) if (w.kind === 'power' && w.status === 'open') void remediate(conn, w.id);
     if (!suspects.length) return;
 
     const limits =
       KIND_LIST.map(k => `${k} (${SENSORS[k].name}): normal ${SENSORS[k].normal} ${SENSORS[k].unit}, warning ${SENSORS[k].warn}, critical ${SENSORS[k].crit}`).join('\n') +
       '\ncdu (coolant distribution unit, liquid cooling for a whole aisle of GPU racks): normal flow ~120 L/min and pressure ~210 kPa; warning below 90 L/min or 160 kPa; critical below 50 L/min or 110 kPa. A failing CDU overheats every rack in its aisle within minutes.';
     const reply = await askNemotron(
-      `You are a data center reliability agent. Readings come every 3 seconds. Decide which sensors need a technician NOW, before they cross the warning limit. Ignore normal noise. Reply with JSON only.\nLimits:\n${limits}`,
-      `Sensors trending (oldest to newest):\n${suspects.map(x => `${x.rackId} ${x.kind === ('cdu' as Kind) ? 'cdu flow L/min' : x.kind}: ${x.series.join(', ')}${x.extra ? ` (${x.extra})` : ''}`).join('\n')}\n\nReturn: {"alerts":[{"rackId":"R-12","kind":"cooling|power|disk|network|humidity|pdu|cdu","severity":"low|medium|critical","minutesToCritical":3,"reason":"short sentence a tech can act on"}]}. Use an empty list if nothing needs action.`,
+      `You are a data center reliability agent. Readings come every 3 seconds (20 readings = 1 minute). Decide which sensors need a technician NOW, before they cross the warning limit. Ignore normal noise. Reply with JSON only.\nLimits:\n${limits}`,
+      `Sensors trending (oldest to newest):\n${suspects.map(x => `${x.rackId} ${x.kind === ('cdu' as Kind) ? 'cdu flow L/min' : x.kind}: ${x.series.join(', ')}${x.extra ? ` (${x.extra})` : ''}`).join('\n')}\n\nReturn: {"alerts":[{"rackId":"R-12","kind":"cooling|power|disk|network|humidity|pdu|cdu","severity":"low|medium|critical","minutesToCritical":3,"reason":"one plain sentence a tech can act on, with a per-minute rate, e.g. R-12 is heating about 7°F a minute and will pass 82°F in about a minute. Never mention readings."}]}. Use an empty list if nothing needs action.`,
       `trend check on ${suspects.map(x => `${x.rackId}/${x.kind}`).join(', ')}`
     );
     const parsed = parseJson<{ alerts?: { rackId: string; kind?: string; severity: string; minutesToCritical?: number; reason: string }[] }>(reply, 'alerts');
@@ -237,6 +264,222 @@ async function scan(conn: Conn) {
   }
 }
 
+// ─── runbooks: the site procedures the agent must ground its answers in ───
+const RUNBOOKS: Record<string, { title: string; steps: string[] }> = {
+  'RB-CDU-01': {
+    title: 'CDU pump failure / coolant flow loss',
+    steps: [
+      'Confirm flow and pressure on the CDU panel and in monitoring.',
+      'Check pump status and controller alarms; switch to the standby pump if one is fitted.',
+      'Inspect and clean the inlet strainer.',
+      'If the pump is seized, replace the pump cartridge and bleed air from the loop.',
+      'Watch the aisle rack temperatures return below 78°F before closing.',
+    ],
+  },
+  'RB-CDU-02': {
+    title: 'CDU leak / loop pressure loss',
+    steps: [
+      'Check for coolant on the floor and in drip trays; isolate the leaking branch valve.',
+      'Top up coolant to rated pressure.',
+      'Bleed trapped air from the loop.',
+      'Replace the failed fitting or hose.',
+      'Confirm pressure holds above 190 kPa.',
+    ],
+  },
+  'RB-PDU-01': {
+    title: 'PDU feed loss (rack on one feed)',
+    steps: [
+      'Confirm which feed is offline on the PDU display and in monitoring.',
+      'Do not add load to the rack while it runs on one feed.',
+      'Check the upstream breaker; reset it once if no fault is shown.',
+      'Reseat or replace the input cord or PDU input module.',
+      'Confirm both feeds show load and the rack is redundant again.',
+    ],
+  },
+  'RB-THERM-01': {
+    title: 'Rack overheating',
+    steps: [
+      'Check that the aisle CDU is healthy; if not, follow RB-CDU-01 instead.',
+      'Check rack fans and fan tray alarms.',
+      'Check for a blocked intake, missing blanking panels or misplaced floor tiles.',
+      'Replace the failed fan tray or clear the airflow obstruction.',
+      'Confirm the rack temperature is back below 78°F.',
+    ],
+  },
+  'RB-PWR-01': {
+    title: 'Runaway workload / power spike',
+    steps: [
+      'Identify the workload driving the spike from rack power telemetry.',
+      'Move the workload to a rack with spare power, or apply a power cap.',
+      'Confirm rack power is back under 12 kW.',
+    ],
+  },
+  'RB-GEN-01': {
+    title: 'General hardware fault',
+    steps: [
+      'Review telemetry and alarms for the rack.',
+      'Inspect the rack and the failing component in person.',
+      'Repair or replace the failing component.',
+      'Confirm the sensors return to normal.',
+    ],
+  },
+};
+const RUNBOOKS_FOR: Record<string, string[]> = {
+  cdu: ['RB-CDU-01', 'RB-CDU-02'],
+  pdu: ['RB-PDU-01'],
+  power: ['RB-PWR-01'],
+  cooling: ['RB-THERM-01', 'RB-CDU-01'],
+};
+function runbookText(kind: string) {
+  return (RUNBOOKS_FOR[kind] ?? ['RB-GEN-01'])
+    .map(id => `${id} (${RUNBOOKS[id].title}):\n${RUNBOOKS[id].steps.map((s, i) => `  step ${i + 1}: ${s}`).join('\n')}`)
+    .join('\n');
+}
+
+// ─── why-analysis: grounded root cause with a confidence level ───
+const analyzing = new Set<bigint>();
+async function analyze(conn: Conn, warningId: bigint) {
+  const w = conn.db.warning.id.find(warningId);
+  if (!w || w.status === 'resolved' || analyzing.has(warningId) || conn.db.analysis.warningId.find(warningId)) return;
+  // Overheating in an aisle whose CDU is failing is a symptom: the CDU's analysis covers it.
+  if (w.kind === 'cooling') {
+    const aisle = conn.db.rack.id.find(w.rackId)?.aisle;
+    if ([...conn.db.warning.iter()].some(x => x.kind === 'cdu' && x.rackId === `CDU-${aisle}` && x.status !== 'resolved')) return;
+  }
+  analyzing.add(warningId);
+  try {
+    const inc = conn.db.incident.warningId.find(warningId);
+    const reply = await askNemotron(
+      'You are a data center root-cause analyst explaining a problem to a technician. Use ONLY the telemetry, the similar past fix and the runbooks given below. rootCause: one plain sentence under 15 words naming the failing part and what it is doing. evidence: 2 to 4 short plain-English sentences, each with a real number from the telemetry, in per-minute terms (never say "per reading"). Cite exactly one runbook step by id and step number. Give a confidence from 0 to 100; lower it when the evidence is thin or does not match a runbook. Reply with JSON only.',
+      `${w.kind === 'reported' ? 'Issue a technician reported' : `Sensor warning (${w.kind})`} on ${w.rackId}, severity ${w.severity}: ${w.message}\n${telemetryTool(conn, w.rackId, w.kind)}\nSimilar past fix: ${inc?.similarFix || 'none on record'}\n\nRunbooks:\n${runbookText(w.kind)}\n\nReturn: {"rootCause":"CDU-X pump is failing and starving the aisle of coolant","evidence":["Coolant flow fell to 61 L/min and is dropping 40 L/min each minute."],"runbook":"RB-XXX-NN step N","confidence":75}`,
+      `why-analysis for ${w.rackId}`
+    );
+    const a = parseJson<{ rootCause?: string; evidence?: string[] | string; runbook?: string; confidence?: number }>(reply, 'rootCause');
+    if (!a?.rootCause) return;
+    // Check the citation is real. An invented runbook step caps confidence.
+    const m = `${a.runbook ?? ''}`.match(/(RB-[A-Z]+-\d+)\D*(\d+)?/i);
+    const id = m?.[1]?.toUpperCase();
+    const step = Number(m?.[2] ?? 0);
+    const book = id ? RUNBOOKS[id] : undefined;
+    const valid = !!book && step >= 1 && step <= book.steps.length;
+    let confidence = Math.max(0, Math.min(100, Math.round(Number(a.confidence) || 0)));
+    if (!valid) confidence = Math.min(confidence, 40);
+    const runbook = valid ? `${id} step ${step}: ${book!.steps[step - 1]}` : 'No valid runbook step cited.';
+    const evidence = (Array.isArray(a.evidence) ? a.evidence : [a.evidence ?? '']).filter(Boolean).join(' · ');
+    safe('setAnalysis', conn.reducers.setAnalysis({ warningId, rootCause: a.rootCause, evidence, runbook, confidence, callSenior: confidence < 60 }));
+    log('🔎', `Why-analysis for ${w.rackId}: ${a.rootCause} (${confidence}% confident${valid ? '' : ', no valid runbook cited'})`);
+  } catch (e) {
+    log('⚠️', `Analysis failed for ${w.rackId}: ${(e as Error).message}`);
+  } finally {
+    analyzing.delete(warningId);
+  }
+}
+
+// ─── live news: is a tenant extra sensitive to an outage right now? ───
+// The tenants are sample data, so each one is watched through a real company in the same
+// industry (an illustrative stand-in, NOT an NMC² customer). Real headlines, scored by Nemotron.
+const STAND_IN: Record<string, string> = {
+  'Apex Racing Dynamics': 'Williams Racing',
+  'Helix Therapeutics': 'Pfizer',
+  'Sentinel Pay': 'PayPal',
+  'Meridian Weather Lab': 'NOAA',
+  'Orbit Labs': 'OpenAI',
+  'Northgate University': 'UT Dallas',
+};
+const NEWS_BASE = process.env.NEWS_RSS_BASE ?? 'https://news.google.com/rss/search';
+const NEWS_EVERY_MS = 10 * 60_000;
+
+type Headline = { title: string; url: string; source: string; date: string };
+async function headlines(company: string): Promise<Headline[]> {
+  const url = `${NEWS_BASE}?q=${encodeURIComponent(`"${company}" when:14d`)}&hl=en-US&gl=US&ceid=US:en`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000), headers: { 'User-Agent': 'night-watch-agent' } });
+  if (!res.ok) throw new Error(`news ${res.status}`);
+  const xml = await res.text();
+  const tag = (s: string, t: string) => (s.match(new RegExp(`<${t}[^>]*>([\\s\\S]*?)</${t}>`))?.[1] ?? '').replace(/<!\[CDATA\[|\]\]>/g, '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+  return [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 8).map(m => ({ title: tag(m[1], 'title'), url: tag(m[1], 'link'), source: tag(m[1], 'source'), date: tag(m[1], 'pubDate') }));
+}
+
+let newsRunning = false;
+async function checkNews(conn: Conn) {
+  if (newsRunning) return;
+  newsRunning = true;
+  try {
+    for (const tn of conn.db.tenant.iter()) {
+      const company = STAND_IN[tn.name];
+      if (!company) continue;
+      let items: Headline[] = [];
+      try {
+        items = await headlines(company);
+      } catch (e) {
+        log('📰', `Couldn't fetch news for ${company} (${(e as Error).message}); keeping the last signal.`);
+        continue;
+      }
+      if (!items.length) {
+        safe('setTenantSignal', conn.reducers.setTenantSignal({ tenantId: tn.id, company, headline: 'No recent headlines', url: '', source: '', publishedAt: '', score: 0, note: 'Nothing in the news in the last 2 weeks.' }));
+        continue;
+      }
+      const reply = await askNemotron(
+        'You assess how sensitive a data center customer is to an outage right now, based on recent news about them. Score 2 (hot) if they are dealing with a security breach, a major outage, a lawsuit or regulator action, or a public crisis: any downtime will look like a second failure. Score 1 (watch) for layoffs, bad earnings, leadership turmoil or heavy press attention. Score 0 for normal news. Use only the headlines given. Reply with JSON only.',
+        `Company: ${company}\nHeadlines from the last 2 weeks:\n${items.map((h, i) => `${i}. ${h.title} (${h.source}, ${h.date})`).join('\n')}\n\nReturn: {"score":0,"headline":0,"note":"one short sentence on why this matters for an outage"}`,
+        `news check on ${company}`
+      );
+      const a = parseJson<{ score?: number; headline?: number; note?: string }>(reply, 'score');
+      if (!a) continue;
+      const h = items[Math.max(0, Math.min(items.length - 1, Number(a.headline) || 0))];
+      const score = Math.max(0, Math.min(2, Math.round(Number(a.score) || 0)));
+      safe('setTenantSignal', conn.reducers.setTenantSignal({ tenantId: tn.id, company, headline: h.title, url: h.url, source: h.source, publishedAt: h.date, score, note: a.note ?? '' }));
+      log('📰', `${tn.name} (via ${company}): ${['normal', 'watch', 'HOT'][score]}: ${h.title}`);
+    }
+  } catch (e) {
+    log('⚠️', `News check failed: ${(e as Error).message}`);
+  } finally {
+    newsRunning = false;
+  }
+}
+
+// ─── self-fix: the agent resolves a runaway job without paging anyone ───
+// One approved action (move the job to a healthy rack with spare power). Nemotron picks the target
+// from a list of safe candidates; anything outside that list is ignored.
+const fixing = new Set<bigint>();
+async function remediate(conn: Conn, warningId: bigint) {
+  const w = conn.db.warning.id.find(warningId);
+  if (!w || w.kind !== 'power' || w.status !== 'open' || fixing.has(warningId)) return;
+  fixing.add(warningId);
+  try {
+    const src = conn.db.rack.id.find(w.rackId);
+    const candidates = [...conn.db.rack.iter()]
+      .filter(r => r.id !== w.rackId && r.status === 'ok' && r.powerKw <= 11)
+      .sort((a, b) => a.powerKw - b.powerKw)
+      .slice(0, 4);
+    if (src && src.powerKw < 12) return; // not clearly a runaway job yet; the scan checks again in a few seconds
+    if (!src || !candidates.length) {
+      log('🛑', `No safe rack to move ${w.rackId}'s job to; leaving it for a tech.`);
+      return;
+    }
+    let target = candidates[0].id;
+    let reason = `${target} has the most spare power.`;
+    try {
+      const reply = await askNemotron(
+        'You are a data center operations agent allowed to take ONE action by yourself: move a runaway workload off an overloaded rack to a healthy rack with spare power. Pick the best target from the candidates only. Prefer the most spare power, and a different aisle so heat does not pile up in one place. Reply with JSON only.',
+        `Overloaded rack: ${w.rackId} (aisle ${src.aisle}), ${src.powerKw.toFixed(1)} kW, rising. Normal is about 9 kW, warning at 14 kW.\nCandidates:\n${candidates.map(r => `- ${r.id} (aisle ${r.aisle}): ${r.powerKw.toFixed(1)} kW, ${r.temperatureF.toFixed(1)}°F`).join('\n')}\n\nReturn: {"target":"R-16","reason":"one short sentence"}`,
+        `self-fix target for ${w.rackId}`
+      );
+      const a = parseJson<{ target?: string; reason?: string }>(reply, 'target');
+      const pick = `${a?.target ?? ''}`.toUpperCase().match(/R-\d+/)?.[0];
+      if (pick && candidates.some(c => c.id === pick)) {
+        target = pick;
+        reason = a?.reason || reason;
+      }
+    } catch (e) {
+      log('⚠️', `Nemotron unavailable for the self-fix (${(e as Error).message}); using the rack with the most spare power.`);
+    }
+    safe('agentMoveJob', conn.reducers.agentMoveJob({ warningId, targetRackId: target, reason }));
+    log('🤖', `Fixed ${w.rackId} myself: moved the runaway job to ${target}. ${reason}`);
+  } finally {
+    fixing.delete(warningId);
+  }
+}
+
 // Pull steps out of almost-JSON, e.g. {"description","text","executor":"agent"}.
 function salvageSteps(text: string) {
   const out: { description: string; executor: string }[] = [];
@@ -251,12 +494,13 @@ const planning = new Set<bigint>();
 async function plan(conn: Conn, warningId: bigint) {
   const w = conn.db.warning.id.find(warningId);
   if (!w || w.status === 'resolved' || planning.has(warningId)) return;
+  if (w.kind === 'power') return void remediate(conn, warningId); // the agent handles these itself
   if ([...conn.db.task.iter()].some(t => t.warningId === warningId)) return;
   planning.add(warningId);
   try {
     const reply = await askNemotron(
       'You are a data center operations agent. Write a short fix plan. You (the agent) can only read telemetry and check monitoring data. Anything physical or hands-on (inspecting, replacing, cleaning, reseating, mopping, swapping parts) is a "tech" step, and every plan must include at least one "tech" step. Look for root causes: if a rack is hot and its aisle CDU flow is low, the CDU is the real problem; if a rack shows a PDU OFFLINE, it has no backup power and any extra load can trip it. Put agent steps before technician steps. Reply with JSON only.',
-      `${w.kind === 'reported' ? 'Issue a technician reported (sensors cannot see it)' : `Sensor warning (${w.kind})`} on ${w.rackId}, severity ${w.severity}: ${w.message}\n${telemetryTool(conn, w.rackId, w.kind)}\n\nReturn: {"steps":[{"description":"one sentence","executor":"agent|tech"}]} with 3 to 5 steps.`,
+      `${w.kind === 'reported' ? 'Issue a technician reported (sensors cannot see it)' : `Sensor warning (${w.kind})`} on ${w.rackId}, severity ${w.severity}: ${w.message}\n${telemetryTool(conn, w.rackId, w.kind)}\n\nFollow these site runbooks where they apply:\n${runbookText(w.kind)}\n\nReturn: {"steps":[{"description":"one sentence","executor":"agent|tech"}]} with 3 to 5 steps.`,
       `fix plan for ${w.rackId}`
     );
     let steps = parseJson<{ steps?: { description: string; executor: string }[] }>(reply, 'steps')?.steps ?? [];
@@ -296,9 +540,9 @@ function runAgentSteps(conn: Conn) {
     if (blocked) continue;
     // Verification steps after a fix wait until the sensor data has confirmed it.
     const afterTech = all.some(o => o.warningId === t.warningId && o.executor === 'tech' && o.stepNumber < t.stepNumber);
-    if (afterTech && w.status !== 'resolved') continue;
+    if ((afterTech || t.description.startsWith('Confirm')) && w.status !== 'resolved') continue;
     ranSteps.add(t.id);
-    safe('updateTask', conn.reducers.updateTask({ taskId: t.id, status: 'done', result: telemetryTool(conn, w.rackId, w.kind) }));
+    safe('updateTask', conn.reducers.updateTask({ taskId: t.id, status: 'done', result: plainReadout(conn, w.rackId) }));
     log('🔧', `Agent ran step ${t.stepNumber} on ${w.rackId}`);
   }
 }
@@ -349,7 +593,11 @@ DbConnection.builder()
   .onConnect((conn, _id, token) => {
     writeFileSync(TOKEN_FILE, token);
     log('🔌', `Connected to Spacetime database ${DB_NAME}`);
-    conn.db.warning.onInsert((_ctx, w) => void plan(conn, w.id));
+    conn.db.warning.onInsert((_ctx, w) => {
+      void plan(conn, w.id);
+      // Give the backend one tick to build the incident (similar past fix) before analyzing.
+      setTimeout(() => void analyze(conn, w.id), 4_000);
+    });
     conn.db.task.onInsert(() => runAgentSteps(conn));
     conn.db.task.onUpdate(() => runAgentSteps(conn));
     conn.db.warning.onUpdate(() => runAgentSteps(conn));
@@ -358,10 +606,17 @@ DbConnection.builder()
       .subscriptionBuilder()
       .onApplied(() => {
         log('👀', 'Watching racks, warnings and handoffs…');
-        for (const w of conn.db.warning.iter()) void plan(conn, w.id);
+        for (const w of conn.db.warning.iter()) {
+          void plan(conn, w.id);
+          void analyze(conn, w.id);
+        }
         for (const h of conn.db.handoff.iter()) void brief(conn, h.id);
         runAgentSteps(conn);
         setInterval(() => void scan(conn), SCAN_EVERY_MS);
+        if (process.env.NEWS !== 'off') {
+          setTimeout(() => void checkNews(conn), 5_000);
+          setInterval(() => void checkNews(conn), NEWS_EVERY_MS);
+        }
       })
       .subscribe([
         'SELECT * FROM rack',
@@ -372,6 +627,10 @@ DbConnection.builder()
         'SELECT * FROM tech',
         'SELECT * FROM cdu',
         'SELECT * FROM cdu_reading',
+        'SELECT * FROM incident',
+        'SELECT * FROM analysis',
+        'SELECT * FROM tenant',
+        'SELECT * FROM tenant_signal',
       ]);
   })
   .onConnectError((_ctx, err) => console.error('Spacetime connection error:', err))
