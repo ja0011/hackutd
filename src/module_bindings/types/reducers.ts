@@ -7,28 +7,34 @@ import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
 import AddTaskReducer from "../add_task_reducer";
+import BreakCduReducer from "../break_cdu_reducer";
 import BreakRackReducer from "../break_rack_reducer";
 import ClaimWarningReducer from "../claim_warning_reducer";
 import CreateHandoffReducer from "../create_handoff_reducer";
 import MarkFixedReducer from "../mark_fixed_reducer";
 import RaiseWarningReducer from "../raise_warning_reducer";
+import ReportIssueReducer from "../report_issue_reducer";
 import ResetDemoReducer from "../reset_demo_reducer";
 import SetTechWalletReducer from "../set_tech_wallet_reducer";
 import SetTxSignatureReducer from "../set_tx_signature_reducer";
 import SignHandoffReducer from "../sign_handoff_reducer";
 import UpdateHandoffBriefReducer from "../update_handoff_brief_reducer";
 import UpdateTaskReducer from "../update_task_reducer";
+import VerifyFixReducer from "../verify_fix_reducer";
 
 export type AddTaskParams = __Infer<typeof AddTaskReducer>;
+export type BreakCduParams = __Infer<typeof BreakCduReducer>;
 export type BreakRackParams = __Infer<typeof BreakRackReducer>;
 export type ClaimWarningParams = __Infer<typeof ClaimWarningReducer>;
 export type CreateHandoffParams = __Infer<typeof CreateHandoffReducer>;
 export type MarkFixedParams = __Infer<typeof MarkFixedReducer>;
 export type RaiseWarningParams = __Infer<typeof RaiseWarningReducer>;
+export type ReportIssueParams = __Infer<typeof ReportIssueReducer>;
 export type ResetDemoParams = __Infer<typeof ResetDemoReducer>;
 export type SetTechWalletParams = __Infer<typeof SetTechWalletReducer>;
 export type SetTxSignatureParams = __Infer<typeof SetTxSignatureReducer>;
 export type SignHandoffParams = __Infer<typeof SignHandoffReducer>;
 export type UpdateHandoffBriefParams = __Infer<typeof UpdateHandoffBriefReducer>;
 export type UpdateTaskParams = __Infer<typeof UpdateTaskReducer>;
+export type VerifyFixParams = __Infer<typeof VerifyFixReducer>;
 

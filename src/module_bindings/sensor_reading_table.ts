@@ -15,5 +15,10 @@ export default __t.row({
   rackId: __t.string().name("rack_id"),
   temperatureF: __t.f64().name("temperature_f"),
   powerKw: __t.f64().name("power_kw"),
+  humidityPct: __t.f64().name("humidity_pct"),
+  diskErrors: __t.u32().name("disk_errors"),
+  packetLossPct: __t.f64().name("packet_loss_pct"),
+  pduALoadPct: __t.f64().name("pdu_a_load_pct"),
+  pduBLoadPct: __t.f64().name("pdu_b_load_pct"),
   at: __t.timestamp(),
 });

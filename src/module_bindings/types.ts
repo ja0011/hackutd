@@ -10,6 +10,27 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
+export const Cdu = __t.object("Cdu", {
+  id: __t.string(),
+  aisle: __t.string(),
+  flowLpm: __t.f64(),
+  pressureKpa: __t.f64(),
+  supplyTempC: __t.f64(),
+  status: __t.string(),
+  fault: __t.string(),
+});
+export type Cdu = __Infer<typeof Cdu>;
+
+export const CduReading = __t.object("CduReading", {
+  id: __t.u64(),
+  cduId: __t.string(),
+  flowLpm: __t.f64(),
+  pressureKpa: __t.f64(),
+  supplyTempC: __t.f64(),
+  at: __t.timestamp(),
+});
+export type CduReading = __Infer<typeof CduReading>;
+
 export const ChainRecord = __t.object("ChainRecord", {
   id: __t.u64(),
   kind: __t.string(),
@@ -39,8 +60,15 @@ export const Rack = __t.object("Rack", {
   aisle: __t.string(),
   temperatureF: __t.f64(),
   powerKw: __t.f64(),
+  humidityPct: __t.f64(),
+  diskErrors: __t.u32(),
+  packetLossPct: __t.f64(),
+  pduAOnline: __t.bool(),
+  pduBOnline: __t.bool(),
+  pduALoadPct: __t.f64(),
+  pduBLoadPct: __t.f64(),
   status: __t.string(),
-  failing: __t.bool(),
+  fault: __t.string(),
 });
 export type Rack = __Infer<typeof Rack>;
 
@@ -49,6 +77,11 @@ export const SensorReading = __t.object("SensorReading", {
   rackId: __t.string(),
   temperatureF: __t.f64(),
   powerKw: __t.f64(),
+  humidityPct: __t.f64(),
+  diskErrors: __t.u32(),
+  packetLossPct: __t.f64(),
+  pduALoadPct: __t.f64(),
+  pduBLoadPct: __t.f64(),
   at: __t.timestamp(),
 });
 export type SensorReading = __Infer<typeof SensorReading>;
@@ -82,13 +115,16 @@ export type Tech = __Infer<typeof Tech>;
 export const Warning = __t.object("Warning", {
   id: __t.u64(),
   rackId: __t.string(),
+  kind: __t.string(),
   severity: __t.string(),
   message: __t.string(),
   status: __t.string(),
   source: __t.string(),
+  reportedBy: __t.option(__t.u64()),
   createdAt: __t.timestamp(),
   claimedBy: __t.option(__t.u64()),
   claimedAt: __t.option(__t.timestamp()),
+  verifiedBy: __t.option(__t.u64()),
   resolvedAt: __t.option(__t.timestamp()),
 });
 export type Warning = __Infer<typeof Warning>;

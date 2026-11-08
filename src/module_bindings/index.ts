@@ -35,21 +35,26 @@ import {
 
 // Import all reducer arg schemas
 import AddTaskReducer from "./add_task_reducer";
+import BreakCduReducer from "./break_cdu_reducer";
 import BreakRackReducer from "./break_rack_reducer";
 import ClaimWarningReducer from "./claim_warning_reducer";
 import CreateHandoffReducer from "./create_handoff_reducer";
 import MarkFixedReducer from "./mark_fixed_reducer";
 import RaiseWarningReducer from "./raise_warning_reducer";
+import ReportIssueReducer from "./report_issue_reducer";
 import ResetDemoReducer from "./reset_demo_reducer";
 import SetTechWalletReducer from "./set_tech_wallet_reducer";
 import SetTxSignatureReducer from "./set_tx_signature_reducer";
 import SignHandoffReducer from "./sign_handoff_reducer";
 import UpdateHandoffBriefReducer from "./update_handoff_brief_reducer";
 import UpdateTaskReducer from "./update_task_reducer";
+import VerifyFixReducer from "./verify_fix_reducer";
 
 // Import all procedure arg schemas
 
 // Import all table schema definitions
+import CduRow from "./cdu_table";
+import CduReadingRow from "./cdu_reading_table";
 import ChainRecordRow from "./chain_record_table";
 import HandoffRow from "./handoff_table";
 import RackRow from "./rack_table";
@@ -62,6 +67,31 @@ import WarningRow from "./warning_table";
 
 /** The schema information for all tables in this module. This is defined the same was as the tables would have been defined in the server. */
 const tablesSchema = __schema({
+  cdu: __table({
+    name: 'cdu',
+    indexes: [
+      { accessor: 'id', name: 'cdu_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'cdu_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, CduRow),
+  cduReading: __table({
+    name: 'cdu_reading',
+    indexes: [
+      { accessor: 'cduId', name: 'cdu_reading_cdu_id_idx_btree', algorithm: 'btree', columns: [
+        'cduId',
+      ] },
+      { accessor: 'id', name: 'cdu_reading_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'cdu_reading_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, CduReadingRow),
   chainRecord: __table({
     name: 'chain_record',
     indexes: [
@@ -153,17 +183,20 @@ const tablesSchema = __schema({
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
   __reducerSchema("add_task", AddTaskReducer),
+  __reducerSchema("break_cdu", BreakCduReducer),
   __reducerSchema("break_rack", BreakRackReducer),
   __reducerSchema("claim_warning", ClaimWarningReducer),
   __reducerSchema("create_handoff", CreateHandoffReducer),
   __reducerSchema("mark_fixed", MarkFixedReducer),
   __reducerSchema("raise_warning", RaiseWarningReducer),
+  __reducerSchema("report_issue", ReportIssueReducer),
   __reducerSchema("reset_demo", ResetDemoReducer),
   __reducerSchema("set_tech_wallet", SetTechWalletReducer),
   __reducerSchema("set_tx_signature", SetTxSignatureReducer),
   __reducerSchema("sign_handoff", SignHandoffReducer),
   __reducerSchema("update_handoff_brief", UpdateHandoffBriefReducer),
   __reducerSchema("update_task", UpdateTaskReducer),
+  __reducerSchema("verify_fix", VerifyFixReducer),
 );
 
 /** The schema information for all procedures in this module. This is defined the same way as the procedures would have been defined in the server. */

@@ -12,4 +12,5 @@ import {
 
 export default {
   rackId: __t.string(),
+  fault: __t.string(),
 };

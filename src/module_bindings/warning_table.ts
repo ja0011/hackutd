@@ -13,12 +13,15 @@ import {
 export default __t.row({
   id: __t.u64().primaryKey(),
   rackId: __t.string().name("rack_id"),
+  kind: __t.string(),
   severity: __t.string(),
   message: __t.string(),
   status: __t.string(),
   source: __t.string(),
+  reportedBy: __t.option(__t.u64()).name("reported_by"),
   createdAt: __t.timestamp().name("created_at"),
   claimedBy: __t.option(__t.u64()).name("claimed_by"),
   claimedAt: __t.option(__t.timestamp()).name("claimed_at"),
+  verifiedBy: __t.option(__t.u64()).name("verified_by"),
   resolvedAt: __t.option(__t.timestamp()).name("resolved_at"),
 });

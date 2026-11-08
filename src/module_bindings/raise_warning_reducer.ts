@@ -12,6 +12,7 @@ import {
 
 export default {
   rackId: __t.string(),
+  kind: __t.string(),
   severity: __t.string(),
   message: __t.string(),
 };
